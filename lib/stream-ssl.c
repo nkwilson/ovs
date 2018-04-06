@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,13 +33,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "coverage.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "entropy.h"
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
 #include "openflow/openflow.h"
 #include "packets.h"
-#include "poll-loop.h"
-#include "shash.h"
+#include "openvswitch/poll-loop.h"
+#include "openvswitch/shash.h"
 #include "socket-util.h"
 #include "util.h"
 #include "stream-provider.h"
@@ -162,6 +162,8 @@ struct ssl_config_file {
 static struct ssl_config_file private_key;
 static struct ssl_config_file certificate;
 static struct ssl_config_file ca_cert;
+static char *ssl_protocols = "TLSv1,TLSv1.1,TLSv1.2";
+static char *ssl_ciphers = "HIGH:!aNULL:!MD5";
 
 /* Ordinarily, the SSL client and server verify each other's certificates using
  * a CA certificate.  Setting this to false disables this behavior.  (This is a
@@ -218,8 +220,9 @@ want_to_poll_events(int want)
     }
 }
 
+/* Takes ownership of 'name'. */
 static int
-new_ssl_stream(const char *name, int fd, enum session_type type,
+new_ssl_stream(char *name, int fd, enum session_type type,
                enum ssl_state state, struct stream **streamp)
 {
     struct ssl_stream *sslv;
@@ -297,6 +300,7 @@ error:
         SSL_free(ssl);
     }
     closesocket(fd);
+    free(name);
     return retval;
 }
 
@@ -321,7 +325,7 @@ ssl_open(const char *name, char *suffix, struct stream **streamp, uint8_t dscp)
                              dscp);
     if (fd >= 0) {
         int state = error ? STATE_TCP_CONNECTING : STATE_SSL_CONNECTING;
-        return new_ssl_stream(name, fd, CLIENT, state, streamp);
+        return new_ssl_stream(xstrdup(name), fd, CLIENT, state, streamp);
     } else {
         VLOG_ERR("%s: connect: %s", name, ovs_strerror(error));
         return error;
@@ -408,12 +412,6 @@ do_ca_cert_bootstrap(struct stream *stream)
     /* SSL_CTX_add_client_CA makes a copy of cert's relevant data. */
     SSL_CTX_add_client_CA(ctx, cert);
 
-    /* SSL_CTX_use_certificate() takes ownership of the certificate passed in.
-     * 'cert' is owned by sslv->ssl, so we need to duplicate it. */
-    cert = X509_dup(cert);
-    if (!cert) {
-        out_of_memory();
-    }
     SSL_CTX_set_cert_store(ctx, X509_STORE_new());
     if (SSL_CTX_load_verify_locations(ctx, ca_cert.file_name, NULL) != 1) {
         VLOG_ERR("SSL_CTX_load_verify_locations: %s",
@@ -422,6 +420,41 @@ do_ca_cert_bootstrap(struct stream *stream)
     }
     VLOG_INFO("killing successful connection to retry using CA cert");
     return EPROTO;
+}
+
+static char *
+get_peer_common_name(const struct ssl_stream *sslv)
+{
+    X509 *peer_cert = SSL_get_peer_certificate(sslv->ssl);
+    if (!peer_cert) {
+        return NULL;
+    }
+
+    int cn_index = X509_NAME_get_index_by_NID(X509_get_subject_name(peer_cert),
+                                              NID_commonName, -1);
+    if (cn_index < 0) {
+        return NULL;
+    }
+
+    X509_NAME_ENTRY *cn_entry = X509_NAME_get_entry(
+        X509_get_subject_name(peer_cert), cn_index);
+    if (!cn_entry) {
+        return NULL;
+    }
+
+    ASN1_STRING *cn_data = X509_NAME_ENTRY_get_data(cn_entry);
+    if (!cn_data) {
+        return NULL;
+    }
+
+    const char *cn;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined (LIBRESSL_VERSION_NUMBER)
+    /* ASN1_STRING_data() is deprecated as of OpenSSL version 1.1 */
+    cn = (const char *)ASN1_STRING_data(cn_data);
+#else
+    cn = (const char *)ASN1_STRING_get0_data(cn_data);
+ #endif
+    return xstrdup(cn);
 }
 
 static int
@@ -461,7 +494,7 @@ ssl_connect(struct stream *stream)
                                      : "SSL_accept"), retval, error, &unused);
                 shutdown(sslv->fd, SHUT_RDWR);
                 stream_report_content(sslv->head, sslv->n_head, STREAM_SSL,
-                                      THIS_MODULE, stream_get_name(stream));
+                                      &this_module, stream_get_name(stream));
                 return EPROTO;
             }
         } else if (bootstrap_ca_cert) {
@@ -481,6 +514,12 @@ ssl_connect(struct stream *stream)
             VLOG_INFO("rejecting SSL connection during bootstrap race window");
             return EPROTO;
         } else {
+            char *cn = get_peer_common_name(sslv);
+
+            if (cn) {
+                stream_set_peer_id(stream, cn);
+                free(cn);
+            }
             return 0;
         }
     }
@@ -676,7 +715,7 @@ ssl_send(struct stream *stream, const void *buffer, size_t n)
         case EAGAIN:
             return n;
         default:
-            sslv->txbuf = NULL;
+            ssl_clear_txbuf(sslv);
             return -error;
         }
     }
@@ -787,8 +826,6 @@ static int
 pssl_open(const char *name OVS_UNUSED, char *suffix, struct pstream **pstreamp,
           uint8_t dscp)
 {
-    char bound_name[SS_NTOP_BUFSIZE + 16];
-    char addrbuf[SS_NTOP_BUFSIZE];
     struct sockaddr_storage ss;
     struct pssl_pstream *pssl;
     uint16_t port;
@@ -806,14 +843,18 @@ pssl_open(const char *name OVS_UNUSED, char *suffix, struct pstream **pstreamp,
     }
 
     port = ss_get_port(&ss);
-    snprintf(bound_name, sizeof bound_name, "ptcp:%"PRIu16":%s",
-             port, ss_format_address(&ss, addrbuf, sizeof addrbuf));
+
+    struct ds bound_name = DS_EMPTY_INITIALIZER;
+    ds_put_format(&bound_name, "pssl:%"PRIu16":", port);
+    ss_format_address(&ss, &bound_name);
 
     pssl = xmalloc(sizeof *pssl);
-    pstream_init(&pssl->pstream, &pssl_pstream_class, bound_name);
+    pstream_init(&pssl->pstream, &pssl_pstream_class,
+                 ds_steal_cstr(&bound_name));
     pstream_set_bound_port(&pssl->pstream, htons(port));
     pssl->fd = fd;
     *pstreamp = &pssl->pstream;
+
     return 0;
 }
 
@@ -829,8 +870,6 @@ static int
 pssl_accept(struct pstream *pstream, struct stream **new_streamp)
 {
     struct pssl_pstream *pssl = pssl_pstream_cast(pstream);
-    char name[SS_NTOP_BUFSIZE + 16];
-    char addrbuf[SS_NTOP_BUFSIZE];
     struct sockaddr_storage ss;
     socklen_t ss_len = sizeof ss;
     int new_fd;
@@ -856,11 +895,12 @@ pssl_accept(struct pstream *pstream, struct stream **new_streamp)
         return error;
     }
 
-    snprintf(name, sizeof name, "tcp:%s:%"PRIu16,
-             ss_format_address(&ss, addrbuf, sizeof addrbuf),
-             ss_get_port(&ss));
-    return new_ssl_stream(name, new_fd, SERVER, STATE_SSL_CONNECTING,
-                          new_streamp);
+    struct ds name = DS_EMPTY_INITIALIZER;
+    ds_put_cstr(&name, "ssl:");
+    ss_format_address(&ss, &name);
+    ds_put_format(&name, ":%"PRIu16, ss_get_port(&ss));
+    return new_ssl_stream(ds_steal_cstr(&name), new_fd, SERVER,
+                          STATE_SSL_CONNECTING, new_streamp);
 }
 
 static void
@@ -972,6 +1012,7 @@ do_ssl_init(void)
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
                        NULL);
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_cipher_list(ctx, "HIGH:!aNULL:!MD5");
 
     return 0;
 }
@@ -1071,7 +1112,7 @@ stream_ssl_set_private_key_file(const char *file_name)
 static void
 stream_ssl_set_certificate_file__(const char *file_name)
 {
-    if (SSL_CTX_use_certificate_chain_file(ctx, file_name) == 1) {
+    if (SSL_CTX_use_certificate_file(ctx, file_name, SSL_FILETYPE_PEM) == 1) {
         certificate.read = true;
     } else {
         VLOG_ERR("SSL_use_certificate_file: %s",
@@ -1120,6 +1161,68 @@ stream_ssl_set_key_and_cert(const char *private_key_file,
     }
 }
 
+/* Sets SSL ciphers based on string input. Aborts with an error message
+ * if 'arg' is invalid. */
+void
+stream_ssl_set_ciphers(const char *arg)
+{
+    if (ssl_init() || !arg || !strcmp(ssl_ciphers, arg)) {
+        return;
+    }
+    if (SSL_CTX_set_cipher_list(ctx,arg) == 0) {
+        VLOG_ERR("SSL_CTX_set_cipher_list: %s",
+                 ERR_error_string(ERR_get_error(), NULL));
+    }
+    ssl_ciphers = xstrdup(arg);
+}
+
+/* Set SSL protocols based on the string input. Aborts with an error message
+ * if 'arg' is invalid. */
+void
+stream_ssl_set_protocols(const char *arg)
+{
+    if (ssl_init() || !arg || !strcmp(arg, ssl_protocols)){
+        return;
+    }
+
+    /* Start with all the flags off and turn them on as requested. */
+    long protocol_flags = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1;
+    protocol_flags |= SSL_OP_NO_TLSv1_1 | SSL_OP_NO_TLSv1_2;
+
+    char *s = xstrdup(arg);
+    char *save_ptr = NULL;
+    char *word = strtok_r(s, " ,\t", &save_ptr);
+    if (word == NULL) {
+        VLOG_ERR("SSL protocol settings invalid");
+        goto exit;
+    }
+    while (word != NULL) {
+        long on_flag;
+        if (!strcasecmp(word, "TLSv1.2")){
+            on_flag = SSL_OP_NO_TLSv1_2;
+        } else if (!strcasecmp(word, "TLSv1.1")){
+            on_flag = SSL_OP_NO_TLSv1_1;
+        } else if (!strcasecmp(word, "TLSv1")){
+            on_flag = SSL_OP_NO_TLSv1;
+        } else {
+            VLOG_ERR("%s: SSL protocol not recognized", word);
+            goto exit;
+        }
+        /* Reverse the no flag and mask it out in the flags
+         * to turn on that protocol. */
+        protocol_flags &= ~on_flag;
+        word = strtok_r(NULL, " ,\t", &save_ptr);
+    };
+
+    /* Set the actual options. */
+    SSL_CTX_set_options(ctx, protocol_flags);
+
+    ssl_protocols = xstrdup(arg);
+
+exit:
+    free(s);
+}
+
 /* Reads the X509 certificate or certificates in file 'file_name'.  On success,
  * stores the address of the first element in an array of pointers to
  * certificates in '*certs' and the number of certificates in the array in
@@ -1144,12 +1247,12 @@ read_cert_file(const char *file_name, X509 ***certs, size_t *n_certs)
     }
 
     for (;;) {
-        X509 *certificate;
+        X509 *cert;
         int c;
 
         /* Read certificate from file. */
-        certificate = PEM_read_X509(file, NULL, NULL, NULL);
-        if (!certificate) {
+        cert = PEM_read_X509(file, NULL, NULL, NULL);
+        if (!cert) {
             size_t i;
 
             VLOG_ERR("PEM_read_X509 failed reading %s: %s",
@@ -1168,7 +1271,7 @@ read_cert_file(const char *file_name, X509 ***certs, size_t *n_certs)
         if (*n_certs >= allocated_certs) {
             *certs = x2nrealloc(*certs, &allocated_certs, sizeof **certs);
         }
-        (*certs)[(*n_certs)++] = certificate;
+        (*certs)[(*n_certs)++] = cert;
 
         /* Are there additional certificates in the file? */
         do {
@@ -1242,8 +1345,6 @@ static void
 stream_ssl_set_ca_cert_file__(const char *file_name,
                               bool bootstrap, bool force)
 {
-    X509 **certs;
-    size_t n_certs;
     struct stat s;
 
     if (!update_ssl_config(&ca_cert, file_name) && !force) {
@@ -1256,33 +1357,26 @@ stream_ssl_set_ca_cert_file__(const char *file_name,
                   "(this is a security risk)");
     } else if (bootstrap && stat(file_name, &s) && errno == ENOENT) {
         bootstrap_ca_cert = true;
-    } else if (!read_cert_file(file_name, &certs, &n_certs)) {
-        size_t i;
+    } else {
+        STACK_OF(X509_NAME) *cert_names = SSL_load_client_CA_file(file_name);
+        if (cert_names) {
+            /* Set up list of CAs that the server will accept from the
+             * client. */
+            SSL_CTX_set_client_CA_list(ctx, cert_names);
 
-        /* Set up list of CAs that the server will accept from the client. */
-        for (i = 0; i < n_certs; i++) {
-            /* SSL_CTX_add_client_CA makes a copy of the relevant data. */
-            if (SSL_CTX_add_client_CA(ctx, certs[i]) != 1) {
-                VLOG_ERR("failed to add client certificate %"PRIuSIZE" from %s: %s",
-                         i, file_name,
+            /* Set up CAs for OpenSSL to trust in verifying the peer's
+             * certificate. */
+            SSL_CTX_set_cert_store(ctx, X509_STORE_new());
+            if (SSL_CTX_load_verify_locations(ctx, file_name, NULL) != 1) {
+                VLOG_ERR("SSL_CTX_load_verify_locations: %s",
                          ERR_error_string(ERR_get_error(), NULL));
-            } else {
-                log_ca_cert(file_name, certs[i]);
+                return;
             }
-            X509_free(certs[i]);
+            bootstrap_ca_cert = false;
+        } else {
+            VLOG_ERR("failed to load client certificates from %s: %s",
+                     file_name, ERR_error_string(ERR_get_error(), NULL));
         }
-        free(certs);
-
-        /* Set up CAs for OpenSSL to trust in verifying the peer's
-         * certificate. */
-        SSL_CTX_set_cert_store(ctx, X509_STORE_new());
-        if (SSL_CTX_load_verify_locations(ctx, file_name, NULL) != 1) {
-            VLOG_ERR("SSL_CTX_load_verify_locations: %s",
-                     ERR_error_string(ERR_get_error(), NULL));
-            return;
-        }
-
-        bootstrap_ca_cert = false;
     }
     ca_cert.read = true;
 }

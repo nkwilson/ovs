@@ -32,6 +32,7 @@ struct dpif_netlink_vport {
 
     /* ovs_vport header. */
     int dp_ifindex;
+    int netnsid;                           /* Network Namespace ID. */
     odp_port_t port_no;                    /* ODPP_NONE if unknown. */
     enum ovs_vport_type type;
 
@@ -57,5 +58,7 @@ int dpif_netlink_vport_get(const char *name, struct dpif_netlink_vport *reply,
                            struct ofpbuf **bufp);
 
 bool dpif_netlink_is_internal_device(const char *name);
+
+enum ovs_vport_type netdev_to_ovs_vport_type(const char *type);
 
 #endif /* dpif-netlink.h */

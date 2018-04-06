@@ -15,6 +15,7 @@
 import atexit
 import os
 import signal
+import sys
 
 import ovs.vlog
 
@@ -42,6 +43,7 @@ def fork():
             cancel()
 
     _hooks = []
+
 
 _added_hook = False
 _files = {}
@@ -55,6 +57,17 @@ def add_file_to_unlink(file):
         _added_hook = True
         add_hook(_unlink_files, _cancel_files, True)
     _files[file] = None
+
+
+def add_file_to_close_and_unlink(file, fd=None):
+    """Registers 'file' to be unlinked when the program terminates via
+    sys.exit() or a fatal signal and the 'fd' to be closed. On Windows a file
+    cannot be removed while it is open for writing."""
+    global _added_hook
+    if not _added_hook:
+        _added_hook = True
+        add_hook(_unlink_files, _cancel_files, True)
+    _files[file] = fd
 
 
 def remove_file_to_unlink(file):
@@ -76,6 +89,8 @@ def unlink_file_now(file):
 
 def _unlink_files():
     for file_ in _files:
+        if sys.platform == "win32" and _files[file_]:
+            _files[file_].close()
         _unlink(file_)
 
 
@@ -90,7 +105,7 @@ def _unlink(file_):
     try:
         os.unlink(file_)
         return 0
-    except OSError, e:
+    except OSError as e:
         return e.errno
 
 
@@ -128,9 +143,35 @@ def _init():
     global _inited
     if not _inited:
         _inited = True
+        if sys.platform == "win32":
+            signals = [signal.SIGTERM, signal.SIGINT]
+        else:
+            signals = [signal.SIGTERM, signal.SIGINT, signal.SIGHUP,
+                       signal.SIGALRM]
 
-        for signr in (signal.SIGTERM, signal.SIGINT,
-                      signal.SIGHUP, signal.SIGALRM):
+        for signr in signals:
             if signal.getsignal(signr) == signal.SIG_DFL:
                 signal.signal(signr, _signal_handler)
         atexit.register(_atexit_handler)
+
+
+def signal_alarm(timeout):
+    if sys.platform == "win32":
+        import os
+        import time
+        import threading
+
+        class Alarm (threading.Thread):
+            def __init__(self, timeout):
+                super(Alarm, self).__init__()
+                self.timeout = timeout
+                self.setDaemon(True)
+
+            def run(self):
+                time.sleep(self.timeout)
+                os._exit(1)
+
+        alarm = Alarm(timeout)
+        alarm.start()
+    else:
+        signal.alarm(timeout)

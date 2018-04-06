@@ -18,7 +18,7 @@
 
 #include "openvswitch/token-bucket.h"
 
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "sat-math.h"
 #include "timeval.h"
 #include "util.h"
@@ -50,7 +50,7 @@ token_bucket_set(struct token_bucket *tb,
 {
     tb->rate = rate;
     tb->burst = burst;
-    if (burst > tb->tokens) {
+    if (burst < tb->tokens) {
         tb->tokens = burst;
     }
 }
@@ -85,12 +85,13 @@ token_bucket_withdraw(struct token_bucket *tb, unsigned int n)
 /* Causes the poll loop to wake up when at least 'n' tokens will be available
  * for withdrawal from 'tb'. */
 void
-token_bucket_wait(struct token_bucket *tb, unsigned int n)
+token_bucket_wait_at(struct token_bucket *tb, unsigned int n,
+                     const char *where)
 {
     if (tb->tokens >= n) {
-        poll_immediate_wake();
+        poll_immediate_wake_at(where);
     } else {
         unsigned int need = n - tb->tokens;
-        poll_timer_wait_until(tb->last_fill + need / tb->rate + 1);
+        poll_timer_wait_until_at(tb->last_fill + need / tb->rate + 1, where);
     }
 }

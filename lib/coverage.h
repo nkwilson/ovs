@@ -75,7 +75,7 @@ void coverage_counter_register(struct coverage_counter*);
         extern struct coverage_counter counter_##COUNTER;               \
         struct coverage_counter counter_##COUNTER                       \
             = { #COUNTER, COUNTER##_count, 0, 0, {0}, {0} };            \
-        OVS_CONSTRUCTOR(COUNTER##_init) {                               \
+        OVS_CONSTRUCTOR(COUNTER##_init_coverage) {                      \
             coverage_counter_register(&counter_##COUNTER);              \
         }
 
@@ -88,6 +88,7 @@ void coverage_counter_register(struct coverage_counter*);
 void coverage_init(void);
 void coverage_log(void);
 void coverage_clear(void);
+void coverage_try_clear(void);
 void coverage_run(void);
 
 #endif /* coverage.h */

@@ -73,6 +73,10 @@ dpif_flow_dump_thread_init(struct dpif_flow_dump_thread *thread,
     thread->dpif = dump->dpif;
 }
 
+struct ct_dpif_dump_state;
+struct ct_dpif_entry;
+struct ct_dpif_tuple;
+
 /* Datapath interface class structure, to be defined by each implementation of
  * a datapath interface.
  *
@@ -153,7 +157,7 @@ struct dpif_class {
     int (*get_stats)(const struct dpif *dpif, struct dpif_dp_stats *stats);
 
     /* Adds 'netdev' as a new port in 'dpif'.  If '*port_no' is not
-     * UINT32_MAX, attempts to use that as the port's port number.
+     * ODPP_NONE, attempts to use that as the port's port number.
      *
      * If port is successfully added, sets '*port_no' to the new port's
      * port number.  Returns EBUSY if caller attempted to choose a port
@@ -164,9 +168,18 @@ struct dpif_class {
     /* Removes port numbered 'port_no' from 'dpif'. */
     int (*port_del)(struct dpif *dpif, odp_port_t port_no);
 
+    /* Refreshes configuration of 'dpif's port. The implementation might
+     * postpone applying the changes until run() is called. */
+    int (*port_set_config)(struct dpif *dpif, odp_port_t port_no,
+                           const struct smap *cfg);
+
     /* Queries 'dpif' for a port with the given 'port_no' or 'devname'.
      * If 'port' is not null, stores information about the port into
      * '*port' if successful.
+     *
+     * If the port doesn't exist, the provider must return ENODEV.  Other
+     * error numbers means that something wrong happened and will be
+     * treated differently by upper layers.
      *
      * If 'port' is not null, the caller takes ownership of data in
      * 'port' and must free it with dpif_port_destroy() when it is no
@@ -269,9 +282,11 @@ struct dpif_class {
      * dpif_flow_dump_thread_init(), respectively.
      *
      * If 'terse' is true, then only UID and statistics will
-     * be returned in the dump. Otherwise, all fields will be returned. */
+     * be returned in the dump. Otherwise, all fields will be returned.
+     *
+     * If 'type' isn't null, dumps only the flows of the given type. */
     struct dpif_flow_dump *(*flow_dump_create)(const struct dpif *dpif,
-                                               bool terse);
+                                               bool terse, char *type);
     int (*flow_dump_destroy)(struct dpif_flow_dump *dump);
 
     struct dpif_flow_dump_thread *(*flow_dump_thread_create)(
@@ -314,12 +329,9 @@ struct dpif_class {
      * */
     int (*handlers_set)(struct dpif *dpif, uint32_t n_handlers);
 
-    /* If 'dpif' creates its own I/O polling threads, refreshes poll threads
-     * configuration.  'n_rxqs' configures the number of rx_queues, which
-     * are distributed among threads.  'cmask' configures the cpu mask
-     * for setting the polling threads' cpu affinity. */
-    int (*poll_threads_set)(struct dpif *dpif, unsigned int n_rxqs,
-                            const char *cmask);
+    /* Pass custom configuration options to the datapath.  The implementation
+     * might postpone applying the changes until run() is called. */
+    int (*set_config)(struct dpif *dpif, const struct smap *other_config);
 
     /* Translates OpenFlow queue ID 'queue_id' (in host byte order) into a
      * priority value used for setting packet priority. */
@@ -361,13 +373,22 @@ struct dpif_class {
      * return. */
     void (*recv_purge)(struct dpif *dpif);
 
+    /* When 'dpif' is about to purge the datapath, the higher layer may want
+     * to be notified so that it could try reacting accordingly (e.g. grabbing
+     * all flow stats before they are gone).
+     *
+     * Registers an upcall callback function with 'dpif'.  This is only used
+     * if 'dpif' needs to notify the purging of datapath.  'aux' is passed to
+     * the callback on invocation. */
+    void (*register_dp_purge_cb)(struct dpif *, dp_purge_callback *, void *aux);
+
     /* For datapaths that run in userspace (i.e. dpif-netdev), threads polling
      * for incoming packets can directly call upcall functions instead of
      * offloading packet processing to separate handler threads. Datapaths
      * that directly call upcall functions should use the functions below to
      * to register an upcall function and enable / disable upcalls.
      *
-     * Registers an upcall callback function with 'dpif'. This is only used if
+     * Registers an upcall callback function with 'dpif'. This is only used
      * if 'dpif' directly executes upcall functions. 'aux' is passed to the
      * callback on invocation. */
     void (*register_upcall_cb)(struct dpif *, upcall_callback *, void *aux);
@@ -381,6 +402,76 @@ struct dpif_class {
     /* Get datapath version. Caller is responsible for freeing the string
      * returned.  */
     char *(*get_datapath_version)(void);
+
+    /* Conntrack entry dumping interface.
+     *
+     * These functions are used by ct-dpif.c to provide a datapath-agnostic
+     * dumping interface to the connection trackers provided by the
+     * datapaths.
+     *
+     * ct_dump_start() should put in '*state' a pointer to a newly allocated
+     * stucture that will be passed by the caller to ct_dump_next() and
+     * ct_dump_done(). If 'zone' is not NULL, only the entries in '*zone'
+     * should be dumped.
+     *
+     * ct_dump_next() should fill 'entry' with information from a connection
+     * and prepare to dump the next one on a subsequest invocation.
+     *
+     * ct_dump_done() should perform any cleanup necessary (including
+     * deallocating the 'state' structure, if applicable). */
+    int (*ct_dump_start)(struct dpif *, struct ct_dpif_dump_state **state,
+                         const uint16_t *zone, int *);
+    int (*ct_dump_next)(struct dpif *, struct ct_dpif_dump_state *state,
+                        struct ct_dpif_entry *entry);
+    int (*ct_dump_done)(struct dpif *, struct ct_dpif_dump_state *state);
+
+    /* Flushes the connection tracking tables.  The arguments have the
+     * following behavior:
+     *
+     *   - If both 'zone' and 'tuple' are NULL, flush all the conntrack
+     *     entries.
+     *   - If 'zone' is not NULL, and 'tuple' is NULL, flush all the
+     *     conntrack entries in '*zone'.
+     *   - If 'tuple' is not NULL, flush the conntrack entry specified by
+     *     'tuple' in '*zone'. If 'zone' is NULL, use the default zone
+     *     (zone 0). */
+    int (*ct_flush)(struct dpif *, const uint16_t *zone,
+                    const struct ct_dpif_tuple *tuple);
+    /* Set max connections allowed. */
+    int (*ct_set_maxconns)(struct dpif *, uint32_t maxconns);
+    /* Get max connections allowed. */
+    int (*ct_get_maxconns)(struct dpif *, uint32_t *maxconns);
+    /* Get number of connections tracked. */
+    int (*ct_get_nconns)(struct dpif *, uint32_t *nconns);
+
+    /* Meters */
+
+    /* Queries 'dpif' for supported meter features.
+     * NULL pointer means no meter features are supported. */
+    void (*meter_get_features)(const struct dpif *,
+                               struct ofputil_meter_features *);
+
+    /* Adds or modifies 'meter' in 'dpif'.   If '*meter_id' is UINT32_MAX,
+     * adds a new meter, otherwise modifies an existing meter.
+     *
+     * If meter is successfully added, sets '*meter_id' to the new meter's
+     * meter id selected by 'dpif'. */
+    int (*meter_set)(struct dpif *, ofproto_meter_id *meter_id,
+                     struct ofputil_meter_config *);
+
+    /* Queries 'dpif' for meter stats with the given 'meter_id'.  Stores
+     * maximum of 'n_bands' meter statistics, returning the number of band
+     * stats returned in 'stats->n_bands' if successful. */
+    int (*meter_get)(const struct dpif *, ofproto_meter_id meter_id,
+                     struct ofputil_meter_stats *, uint16_t n_bands);
+
+    /* Removes meter 'meter_id' from 'dpif'. Stores meter and band statistics
+     * (for maximum of 'n_bands', returning the number of band stats returned
+     * in 'stats->n_bands' if successful.  'stats' may be passed in as NULL if
+     * no stats are needed, in which case 'n_bands' must be passed in as
+     * zero. */
+    int (*meter_del)(struct dpif *, ofproto_meter_id meter_id,
+                     struct ofputil_meter_stats *, uint16_t n_bands);
 };
 
 extern const struct dpif_class dpif_netlink_class;

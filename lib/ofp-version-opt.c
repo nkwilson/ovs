@@ -1,6 +1,6 @@
 #include <config.h>
-#include "dynamic-string.h"
-#include "ofp-util.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/ofp-protocol.h"
 #include "ofp-version-opt.h"
 #include "ovs-thread.h"
 

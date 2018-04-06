@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2011, 2012, 2013, 2014, 2015, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,11 +24,11 @@
 #include <unistd.h>
 #include "command-line.h"
 #include "daemon.h"
-#include "dynamic-string.h"
-#include "ofpbuf.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/ofpbuf.h"
 #include "ovstest.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "socket-util.h"
 #include "unixctl.h"
 #include "util.h"
@@ -106,7 +106,7 @@ print_netflow(struct ofpbuf *buf)
             break;
 
         case IPPROTO_ICMP:
-            printf(", ICMP %"PRIu16":%"PRIu16,
+            printf(", ICMP %u:%u",
                    ntohs(rec->dst_port) >> 8,
                    ntohs(rec->dst_port) & 0xff);
             if (rec->src_port != htons(0)) {
@@ -195,7 +195,7 @@ test_netflow_main(int argc, char *argv[])
     }
 
     daemon_save_fd(STDOUT_FILENO);
-    daemonize_start();
+    daemonize_start(false);
 
     error = unixctl_server_create(NULL, &server);
     if (error) {
@@ -233,6 +233,9 @@ test_netflow_main(int argc, char *argv[])
         unixctl_server_wait(server);
         poll_block();
     }
+
+    ofpbuf_uninit(&buf);
+    unixctl_server_destroy(server);
 }
 
 static void

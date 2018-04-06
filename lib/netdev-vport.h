@@ -31,7 +31,6 @@ void netdev_vport_tunnel_register(void);
 void netdev_vport_patch_register(void);
 
 bool netdev_vport_is_patch(const struct netdev *);
-bool netdev_vport_is_layer3(const struct netdev *);
 
 char *netdev_vport_patch_peer(const struct netdev *netdev);
 
@@ -51,6 +50,5 @@ enum { NETDEV_VPORT_NAME_BUFSIZE = 256 };
 const char *netdev_vport_get_dpif_port(const struct netdev *,
                                        char namebuf[], size_t bufsize)
     OVS_WARN_UNUSED_RESULT;
-char *netdev_vport_get_dpif_port_strdup(const struct netdev *);
 
 #endif /* netdev-vport.h */

@@ -19,15 +19,13 @@
 #ifndef _LLDPD_H
 #define _LLDPD_H
 
-#ifndef _WIN32
+#include <sys/types.h>
 #include <netinet/in.h>
-#endif
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
-#include <sys/types.h>
 #include "dp-packet.h"
-#include "list.h"
+#include "openvswitch/list.h"
 #include "lldpd-structs.h"
 #include "lldp-tlv.h"
 #include "packets.h"
@@ -54,9 +52,7 @@ struct protocol {
     int(*guess)(PROTO_GUESS_SIG);   /* Can be NULL, use MAC address in this
                                      * case
                                      */
-    u_int8_t mac[ETH_ADDR_LEN];  /* Destination MAC address used by this
-                                  * protocol
-                                  */
+    struct eth_addr mac;  /* Destination MAC address used by this protocol */
 };
 
 #define SMART_HIDDEN(port) (port->p_hidden_in)
@@ -73,7 +69,7 @@ struct lldpd {
 static inline struct lldpd_hardware *
 lldpd_first_hardware(struct lldpd *lldpd)
 {
-    return CONTAINER_OF(list_front(&lldpd->g_hardware),
+    return CONTAINER_OF(ovs_list_front(&lldpd->g_hardware),
                         struct lldpd_hardware, h_entries);
 }
 

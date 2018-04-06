@@ -1,4 +1,4 @@
-# Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+# Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017 Nicira, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 AC_PREREQ(2.63)
-AC_INIT(openvswitch, 2.4.90, bugs@openvswitch.org)
+AC_INIT(openvswitch, 2.9.90, bugs@openvswitch.org)
 AC_CONFIG_SRCDIR([datapath/datapath.c])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_AUX_DIR([build-aux])
@@ -23,16 +23,12 @@ AM_INIT_AUTOMAKE([tar-pax])
 
 AC_PROG_CC_C99
 AM_PROG_CC_C_O
+AC_PROG_CXX
 AC_PROG_CPP
 AC_PROG_MKDIR_P
 AC_PROG_FGREP
 AC_PROG_EGREP
-
-AC_ARG_VAR([PERL], [path to Perl interpreter])
-AC_PATH_PROG([PERL], perl, no)
-if test "$PERL" = no; then
-   AC_MSG_ERROR([Perl interpreter not found in $PATH or $PERL.])
-fi
+PKG_PROG_PKG_CONFIG
 
 AM_MISSING_PROG([AUTOM4TE], [autom4te])
 
@@ -67,7 +63,7 @@ m4_pattern_forbid([LT_INIT]) dnl Make autoconf fail if libtool is missing.
 #    the new version. This is the case when symbols have been modified or
 #    deleted. Bump current, set revision and age to 0.
 
-m4_define([libopenvswitch_lt_current],    [1])
+m4_define([libopenvswitch_lt_current],    [0])
 m4_define([libopenvswitch_lt_revision],   [0])
 m4_define([libopenvswitch_lt_age],        [0])
 
@@ -85,14 +81,19 @@ AC_SEARCH_LIBS([pthread_create], [pthread])
 AC_FUNC_STRERROR_R
 
 OVS_CHECK_ESX
+OVS_CHECK_WIN64
 OVS_CHECK_WIN32
 OVS_CHECK_VISUAL_STUDIO_DDK
 OVS_CHECK_COVERAGE
 OVS_CHECK_NDEBUG
 OVS_CHECK_NETLINK
 OVS_CHECK_OPENSSL
+OVS_CHECK_LIBCAPNG
 OVS_CHECK_LOGDIR
 OVS_CHECK_PYTHON
+OVS_CHECK_PYTHON3
+OVS_CHECK_FLAKE8
+OVS_CHECK_SPHINX
 OVS_CHECK_DOT
 OVS_CHECK_IF_PACKET
 OVS_CHECK_IF_DL
@@ -101,8 +102,14 @@ AC_CHECK_DECLS([sys_siglist], [], [], [[#include <signal.h>]])
 AC_CHECK_MEMBERS([struct stat.st_mtim.tv_nsec, struct stat.st_mtimensec],
   [], [], [[#include <sys/stat.h>]])
 AC_CHECK_MEMBERS([struct ifreq.ifr_flagshigh], [], [], [[#include <net/if.h>]])
-AC_CHECK_FUNCS([mlockall strnlen getloadavg statvfs getmntent_r])
-AC_CHECK_HEADERS([mntent.h sys/statvfs.h linux/types.h linux/if_ether.h stdatomic.h])
+AC_CHECK_MEMBERS([struct mmsghdr.msg_len], [], [], [[#include <sys/socket.h>]])
+AC_CHECK_MEMBERS([struct sockaddr_in6.sin6_scope_id], [], [],
+  [[#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>]])
+AC_CHECK_FUNCS([mlockall strnlen getloadavg statvfs getmntent_r sendmmsg clock_gettime])
+AC_CHECK_HEADERS([mntent.h sys/statvfs.h linux/types.h linux/if_ether.h])
+AC_CHECK_HEADERS([linux/net_namespace.h stdatomic.h])
 AC_CHECK_HEADERS([net/if_mib.h], [], [], [[#include <sys/types.h>
 #include <net/if.h>]])
 
@@ -115,7 +122,6 @@ OVS_CHECK_VALGRIND
 OVS_CHECK_SOCKET_LIBS
 OVS_CHECK_XENSERVER_VERSION
 OVS_CHECK_GROFF
-OVS_CHECK_GNU_MAKE
 OVS_CHECK_TLS
 OVS_CHECK_ATOMIC_LIBS
 OVS_CHECK_GCC4_ATOMICS
@@ -126,6 +132,8 @@ OVS_CHECK_ATOMIC_ALWAYS_LOCK_FREE(8)
 OVS_CHECK_POSIX_AIO
 OVS_CHECK_PTHREAD_SET_NAME
 OVS_CHECK_LINUX_HOST
+OVS_LIBTOOL_VERSIONS
+OVS_CHECK_CXX
 AX_FUNC_POSIX_MEMALIGN
 
 OVS_CHECK_INCLUDE_NEXT([stdio.h string.h])
@@ -143,7 +151,7 @@ OVS_ENABLE_OPTION([-Wall])
 OVS_ENABLE_OPTION([-Wextra])
 OVS_ENABLE_OPTION([-Wno-sign-compare])
 OVS_ENABLE_OPTION([-Wpointer-arith])
-OVS_ENABLE_OPTION([-Wformat-security])
+OVS_ENABLE_OPTION([-Wformat -Wformat-security])
 OVS_ENABLE_OPTION([-Wswitch-enum])
 OVS_ENABLE_OPTION([-Wunused-parameter])
 OVS_ENABLE_OPTION([-Wbad-function-cast])
@@ -154,15 +162,24 @@ OVS_ENABLE_OPTION([-Wmissing-prototypes])
 OVS_ENABLE_OPTION([-Wmissing-field-initializers])
 OVS_ENABLE_OPTION([-Wthread-safety])
 OVS_ENABLE_OPTION([-fno-strict-aliasing])
+OVS_ENABLE_OPTION([-Wswitch-bool])
+OVS_ENABLE_OPTION([-Wlogical-not-parentheses])
+OVS_ENABLE_OPTION([-Wsizeof-array-argument])
+OVS_ENABLE_OPTION([-Wbool-compare])
+OVS_ENABLE_OPTION([-Wshift-negative-value])
+OVS_ENABLE_OPTION([-Wduplicated-cond])
 OVS_ENABLE_OPTION([-Qunused-arguments])
+OVS_ENABLE_OPTION([-Wshadow])
 OVS_CONDITIONAL_CC_OPTION([-Wno-unused], [HAVE_WNO_UNUSED])
 OVS_CONDITIONAL_CC_OPTION([-Wno-unused-parameter], [HAVE_WNO_UNUSED_PARAMETER])
 OVS_ENABLE_WERROR
 OVS_ENABLE_SPARSE
+OVS_CTAGS_IDENTIFIERS
 
 AC_ARG_VAR(KARCH, [Kernel Architecture String])
 AC_SUBST(KARCH)
 OVS_CHECK_LINUX
+OVS_CHECK_LINUX_TC
 OVS_CHECK_DPDK
 OVS_CHECK_PRAGMA_MESSAGE
 AC_SUBST([OVS_CFLAGS])

@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2011, 2012, 2013, 2014 The Board of Trustees of The Leland Stanford
+/* Copyright (c) 2008, 2011, 2012, 2013, 2014, 2016 The Board of Trustees of The Leland Stanford
  * Junior University
  *
  * We are making the OpenFlow specification and associated documentation
@@ -53,6 +53,7 @@
 #define OPENFLOW_11_H 1
 
 #include <openflow/openflow-common.h>
+#include <openflow/openflow-1.0.h>
 
 /* OpenFlow 1.1 uses 32-bit port numbers.  Open vSwitch, for now, uses OpenFlow
  * 1.0 port numbers internally.  We map them to OpenFlow 1.0 as follows:
@@ -110,9 +111,9 @@ enum ofp11_port_features {
 struct ofp11_port {
     ovs_be32 port_no;
     uint8_t pad[4];
-    uint8_t hw_addr[OFP_ETH_ALEN];
+    struct eth_addr hw_addr;
     uint8_t pad2[2];                  /* Align to 64 bits. */
-    char name[OFP_MAX_PORT_NAME_LEN]; /* Null-terminated */
+    char name[OFP10_MAX_PORT_NAME_LEN]; /* Null-terminated */
 
     ovs_be32 config;        /* Bitmap of OFPPC_* flags. */
     ovs_be32 state;         /* Bitmap of OFPPS_* and OFPPS11_* flags. */
@@ -133,11 +134,10 @@ OFP_ASSERT(sizeof(struct ofp11_port) == 64);
 struct ofp11_port_mod {
     ovs_be32 port_no;
     uint8_t pad[4];
-    uint8_t hw_addr[OFP_ETH_ALEN]; /* The hardware address is not
-                                      configurable.  This is used to
-                                      sanity-check the request, so it must
-                                      be the same as returned in an
-                                      ofp11_port struct. */
+    struct eth_addr hw_addr; /* The hardware address is not configurable.  This
+                                is used to sanity-check the request, so it must
+                                be the same as returned in an ofp11_port
+                                struct. */
     uint8_t pad2[2];        /* Pad to 64 bits. */
     ovs_be32 config;        /* Bitmap of OFPPC_* flags. */
     ovs_be32 mask;          /* Bitmap of OFPPC_* flags to be changed. */
@@ -173,6 +173,7 @@ enum ofp11_group_mod_command {
     OFPGC11_ADD,          /* New group. */
     OFPGC11_MODIFY,       /* Modify all matching groups. */
     OFPGC11_DELETE,       /* Delete all matching groups. */
+    OFPGC11_ADD_OR_MOD = 0x8000, /* Create new or modify existing group. */
 };
 
 /* OpenFlow 1.1 specific capabilities supported by the datapath (struct
@@ -194,10 +195,10 @@ struct ofp11_match {
     struct ofp11_match_header omh;
     ovs_be32 in_port;          /* Input switch port. */
     ovs_be32 wildcards;        /* Wildcard fields. */
-    uint8_t dl_src[OFP_ETH_ALEN]; /* Ethernet source address. */
-    uint8_t dl_src_mask[OFP_ETH_ALEN]; /* Ethernet source address mask.  */
-    uint8_t dl_dst[OFP_ETH_ALEN]; /* Ethernet destination address. */
-    uint8_t dl_dst_mask[OFP_ETH_ALEN]; /* Ethernet destination address mask. */
+    struct eth_addr dl_src;    /* Ethernet source address. */
+    struct eth_addr dl_src_mask; /* Ethernet source address mask.  */
+    struct eth_addr dl_dst;    /* Ethernet destination address. */
+    struct eth_addr dl_dst_mask; /* Ethernet destination address mask. */
     ovs_be16 dl_vlan;          /* Input VLAN id. */
     uint8_t dl_vlan_pcp;       /* Input VLAN priority. */
     uint8_t pad1[1];           /* Align to 32-bits */
@@ -337,7 +338,7 @@ struct ofp11_flow_mod {
                                     indicates no restriction. */
     ovs_be32 out_group;          /* For OFPFC_DELETE* commands, require
                                     matching entries to include this as an
-                                    output group. A value of OFPG11_ANY
+                                    output group. A value of OFPG_ANY
                                     indicates no restriction. */
     ovs_be16 flags;              /* One of OFPFF_*. */
     ovs_be16 importance;         /* Eviction precedence (OF1.4+). */
@@ -353,20 +354,6 @@ enum ofp11_group_type {
     OFPGT11_SELECT,   /* Select group. */
     OFPGT11_INDIRECT, /* Indirect group. */
     OFPGT11_FF        /* Fast failover group. */
-};
-
-/* Group numbering. Groups can use any number up to OFPG_MAX. */
-enum ofp11_group {
-    /* Last usable group number. */
-    OFPG11_MAX        = 0xffffff00,
-
-    /* Fake groups. */
-    OFPG11_ALL        = 0xfffffffc,  /* Represents all groups for group delete
-                                        commands. */
-    OFPG11_ANY        = 0xffffffff   /* Wildcard group used only for flow stats
-                                        requests. Selects all flows regardless
-                                        of group (including flows with no
-                                        group). */
 };
 
 /* Bucket for use in groups. */
@@ -397,26 +384,6 @@ struct ofp11_queue_get_config_reply {
 };
 OFP_ASSERT(sizeof(struct ofp11_queue_get_config_reply) == 8);
 
-struct ofp11_stats_msg {
-    struct ofp_header header;
-    ovs_be16 type;              /* One of the OFPST_* constants. */
-    ovs_be16 flags;             /* OFPSF_REQ_* flags (none yet defined). */
-    uint8_t pad[4];
-    /* Followed by the body of the request. */
-};
-OFP_ASSERT(sizeof(struct ofp11_stats_msg) == 16);
-
-/* Vendor extension stats message. */
-struct ofp11_vendor_stats_msg {
-    struct ofp11_stats_msg osm; /* Type OFPST_VENDOR. */
-    ovs_be32 vendor;            /* Vendor ID:
-                                 * - MSB 0: low-order bytes are IEEE OUI.
-                                 * - MSB != 0: defined by OpenFlow
-                                 *   consortium. */
-    /* Followed by vendor-defined arbitrary additional data. */
-};
-OFP_ASSERT(sizeof(struct ofp11_vendor_stats_msg) == 20);
-
 /* Stats request of type OFPST_FLOW. */
 struct ofp11_flow_stats_request {
     uint8_t table_id;         /* ID of table to read (from ofp_table_stats),
@@ -426,7 +393,7 @@ struct ofp11_flow_stats_request {
                                  as an output port. A value of OFPP_ANY
                                  indicates no restriction. */
     ovs_be32 out_group;       /* Require matching entries to include this
-                                 as an output group. A value of OFPG11_ANY
+                                 as an output group. A value of OFPG_ANY
                                  indicates no restriction. */
     uint8_t pad2[4];          /* Align to 64 bits. */
     ovs_be64 cookie;          /* Require matching entries to contain this

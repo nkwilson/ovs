@@ -2,8 +2,7 @@ dnl VTEP_OVSDB_INIT([$1])
 dnl
 dnl Creates an empty database named $1.
 m4_define([VTEP_OVSDB_INIT],
-  [OVS_RUNDIR=`pwd`; export OVS_RUNDIR
-   AT_CHECK(
+  [AT_CHECK(
      [ovsdb-tool create $1 $abs_top_srcdir/vtep/vtep.ovsschema],
      [0], [stdout], [ignore])
    AT_CHECK(
@@ -20,7 +19,7 @@ dnl Creates an empty database in the current directory and then starts
 dnl an ovsdb-server on it for vtep-ctl to connect to.
 m4_define([VTEP_CTL_SETUP],
   [VTEP_OVSDB_INIT([db])
-   AT_CHECK([ovsdb-server --detach --no-chdir --pidfile="`pwd`"/pid --remote=punix:socket --unixctl="`pwd`"/unixctl db >/dev/null 2>&1], [0], [ignore], [ignore])])
+   AT_CHECK([ovsdb-server --detach --no-chdir --pidfile --remote=punix:socket db >/dev/null 2>&1], [0], [ignore], [ignore])])
 
 dnl VTEP_CTL_CLEANUP
 dnl
@@ -319,6 +318,38 @@ CHECK_LSWITCHES([a])
 VTEP_CTL_CLEANUP
 AT_CLEANUP
 
+AT_SETUP([add-ls a, get-replication-mode a])
+AT_KEYWORDS([vtep-ctl])
+VTEP_CTL_SETUP
+AT_CHECK([RUN_VTEP_CTL(
+  [add-ls a],
+  [get-replication-mode a])],
+  [0], [[(null)]
+], [], [VTEP_CTL_CLEANUP])
+VTEP_CTL_CLEANUP
+AT_CLEANUP
+
+AT_SETUP([add-ls a, set-replication-mode a source_node])
+AT_KEYWORDS([vtep-ctl])
+VTEP_CTL_SETUP
+AT_CHECK([RUN_VTEP_CTL(
+  [add-ls a],[set-replication-mode a source_node],
+  [get-replication-mode a])],
+  [0], [source_node
+], [], [VTEP_CTL_CLEANUP])
+VTEP_CTL_CLEANUP
+AT_CLEANUP
+
+AT_SETUP([add-ls a, set-replication-mode a service_node])
+AT_KEYWORDS([vtep-ctl])
+VTEP_CTL_SETUP
+AT_CHECK([RUN_VTEP_CTL(
+  [add-ls a],[set-replication-mode a service_node],
+  [get-replication-mode a])],
+  [0], [service_node
+], [], [VTEP_CTL_CLEANUP])
+VTEP_CTL_CLEANUP
+AT_CLEANUP
 
 dnl ----------------------------------------------------------------------
 AT_BANNER([vtep-ctl unit tests -- logical binding tests])
@@ -875,6 +906,8 @@ AT_CHECK([RUN_VTEP_CTL_TOGETHER(
   [get-manager],
   [set-manager tcp:8.9.10.11 tcp:5.4.3.2],
   [get-manager],
+  [--inactivity-probe=30000 set-manager tcp:1.2.3.4],
+  [get-manager],
   [del-manager],
   [get-manager])], [0], [
 
@@ -882,6 +915,8 @@ AT_CHECK([RUN_VTEP_CTL_TOGETHER(
 tcp:4.5.6.7
 
 tcp:5.4.3.2\ntcp:8.9.10.11
+
+tcp:1.2.3.4
 
 
 ], [], [VTEP_CTL_CLEANUP])
@@ -899,7 +934,7 @@ AT_CHECK([RUN_VTEP_CTL(
   [bind-ls a a1 100 ls1],
   [set Physical_Switch a management_ips=[[4.3.2.1]] tunnel_ips=[[1.2.3.4]]])], [0], [ignore], [], [VTEP_CTL_CLEANUP])
 
-AT_CHECK([vtep-ctl --timeout=5 -vreconnect:emer --db=unix:socket show | tail -n+2 | sed 's/=[[a-f0-9-]][[a-f0-9-]]*\}/=<ls>\}/' ], [0], [dnl
+AT_CHECK([vtep-ctl --timeout=5 -vreconnect:emer --db=unix:socket show | tail -n+2 | sed 's/=[[a-f0-9-]][[a-f0-9-]]*}/=<ls>}/' ], [0], [dnl
     Manager "tcp:4.5.6.7"
     Physical_Switch a
         management_ips: [["4.3.2.1"]]

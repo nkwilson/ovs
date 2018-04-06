@@ -10,15 +10,14 @@ VTEP_IDL_FILES = \
 vtep/vtep-idl.ovsidl: $(VTEP_IDL_FILES)
 	$(AM_V_GEN)$(OVSDB_IDLC) annotate $(VTEP_IDL_FILES) > $@.tmp && \
 	mv $@.tmp $@
-CLEANFILES += vtep/vtep-idl.c vtep/vtep-idl.h
 
 # libvtep
 lib_LTLIBRARIES += vtep/libvtep.la
 vtep_libvtep_la_LDFLAGS = \
-	-version-info $(LT_CURRENT):$(LT_REVISION):$(LT_AGE) \
+	$(OVS_LTINFO) \
 	-Wl,--version-script=$(top_builddir)/vtep/libvtep.sym \
 	$(AM_LDFLAGS)
-vtep_libvtep_la_SOURCES = \
+nodist_vtep_libvtep_la_SOURCES = \
 	vtep/vtep-idl.c \
 	vtep/vtep-idl.h
 
@@ -28,7 +27,7 @@ bin_PROGRAMS += \
 MAN_ROOTS += \
    vtep/vtep-ctl.8.in
 
-DISTCLEANFILES += \
+CLEANFILES += \
    vtep/vtep-ctl.8
 
 man_MANS += \
@@ -41,8 +40,10 @@ vtep_vtep_ctl_LDADD = vtep/libvtep.la lib/libopenvswitch.la
 scripts_SCRIPTS += \
     vtep/ovs-vtep
 
-docs += vtep/README.ovs-vtep.md
-EXTRA_DIST += vtep/ovs-vtep
+EXTRA_DIST += vtep/ovs-vtep.in
+CLEANFILES += vtep/ovs-vtep
+
+FLAKE8_PYFILES += vtep/ovs-vtep
 
 # VTEP schema and IDL
 EXTRA_DIST += vtep/vtep.ovsschema
@@ -57,17 +58,17 @@ if HAVE_DOT
 vtep/vtep.gv: ovsdb/ovsdb-dot.in vtep/vtep.ovsschema
 	$(AM_V_GEN)$(OVSDB_DOT) --no-arrows $(srcdir)/vtep/vtep.ovsschema > $@
 vtep/vtep.pic: vtep/vtep.gv ovsdb/dot2pic
-	$(AM_V_GEN)(dot -T plain < vtep/vtep.gv | $(PERL) $(srcdir)/ovsdb/dot2pic -f 3) > $@.tmp && \
+	$(AM_V_GEN)(dot -T plain < vtep/vtep.gv | $(PYTHON) $(srcdir)/ovsdb/dot2pic -f 3) > $@.tmp && \
 	mv $@.tmp $@
 VTEP_PIC = vtep/vtep.pic
 VTEP_DOT_DIAGRAM_ARG = --er-diagram=$(VTEP_PIC)
-DISTCLEANFILES += vtep/vtep.gv vtep/vtep.pic
+CLEANFILES += vtep/vtep.gv vtep/vtep.pic
 endif
 endif
 
 # VTEP schema documentation
 EXTRA_DIST += vtep/vtep.xml
-DISTCLEANFILES += vtep/vtep.5
+CLEANFILES += vtep/vtep.5
 man_MANS += vtep/vtep.5
 vtep/vtep.5: \
 	ovsdb/ovsdb-doc vtep/vtep.xml $(srcdir)/vtep/vtep.ovsschema $(VTEP_PIC)
@@ -81,13 +82,5 @@ vtep/vtep.5: \
 # Version checking for vtep.ovsschema.
 ALL_LOCAL += vtep/vtep.ovsschema.stamp
 vtep/vtep.ovsschema.stamp: vtep/vtep.ovsschema
-	@sum=`sed '/cksum/d' $? | cksum`; \
-	expected=`sed -n 's/.*"cksum": "\(.*\)".*/\1/p' $?`; \
-	if test "X$$sum" = "X$$expected"; then \
-	  touch $@; \
-	else \
-	  ln=`sed -n '/"cksum":/=' $?`; \
-	  echo >&2 "$?:$$ln: The checksum \"$$sum\" was calculated from the schema file and does not match cksum field in the schema file - you should probably update the version number and the checksum in the schema file with the value listed here."; \
-	  exit 1; \
-	fi
+	$(srcdir)/build-aux/cksum-schema-check $? $@
 CLEANFILES += vtep/vtep.ovsschema.stamp

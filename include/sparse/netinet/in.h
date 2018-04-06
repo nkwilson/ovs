@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2011, 2013, 2014, 2015, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,8 +18,14 @@
 #error "Use this header only with sparse.  It is not a correct implementation."
 #endif
 
-#ifndef __NETINET_IN_SPARSE
-#define __NETINET_IN_SPARSE 1
+#define NETINET_IN_H_INCLUDED 1
+
+#ifndef SYS_TYPES_H_INCLUDED
+#error "Must include <sys/types.h> before <netinet/in.h> for FreeBSD support"
+#endif
+
+#ifndef _NETINET_IN_H
+#define _NETINET_IN_H 1
 
 #include "openvswitch/types.h"
 #include <inttypes.h>
@@ -67,32 +73,36 @@ struct sockaddr_in6 {
 #define IPPROTO_ROUTING 43
 #define IPPROTO_FRAGMENT 44
 #define IPPROTO_GRE 47
+#define IPPROTO_ESP 50
 #define IPPROTO_AH 51
 #define IPPROTO_ICMPV6 58
 #define IPPROTO_NONE 59
 #define IPPROTO_DSTOPTS 60
 #define IPPROTO_SCTP 132
 
+#define IPPORT_FTP 21
+#define IPPORT_TFTP 69
+
 /* All the IP options documented in Linux ip(7). */
-#define IP_ADD_MEMBERSHIP 0
-#define IP_DROP_MEMBERSHIP 1
-#define IP_HDRINCL 2
-#define IP_MTU 3
-#define IP_MTU_DISCOVER 4
-#define IP_MULTICAST_IF 5
-#define IP_MULTICAST_LOOP 6
-#define IP_MULTICAST_TTL 7
-#define IP_NODEFRAG 8
-#define IP_OPTIONS 9
-#define IP_PKTINFO 10
+#define IP_ADD_MEMBERSHIP 35
+#define IP_DROP_MEMBERSHIP 36
+#define IP_HDRINCL 3
+#define IP_MTU 14
+#define IP_MTU_DISCOVER 10
+#define IP_MULTICAST_IF 32
+#define IP_MULTICAST_LOOP 34
+#define IP_MULTICAST_TTL 33
+#define IP_NODEFRAG 22
+#define IP_OPTIONS 4
+#define IP_PKTINFO 8
 #define IP_RECVERR 11
-#define IP_RECVOPTS 12
+#define IP_RECVOPTS 6
 #define IP_RECVTOS 13
-#define IP_RECVTTL 14
-#define IP_RETOPTS 15
-#define IP_ROUTER_ALERT 16
-#define IP_TOS 17
-#define IP_TTL 18
+#define IP_RECVTTL 12
+#define IP_RETOPTS 7
+#define IP_ROUTER_ALERT 5
+#define IP_TOS 1
+#define IP_TTL 2
 
 #define INADDR_ANY              0x00000000
 #define INADDR_BROADCAST        0xffffffff
@@ -113,6 +123,7 @@ struct sockaddr_in6 {
      (X)->s6_addr[10] == 0xff &&                \
      (X)->s6_addr[11] == 0xff)
 
+#define INET_ADDRSTRLEN 16
 #define INET6_ADDRSTRLEN 46
 
 #define IPV6_TCLASS   67
@@ -142,4 +153,4 @@ int inet_aton (const char *, struct in_addr *);
 const char *inet_ntop(int, const void *, char *, socklen_t);
 int inet_pton(int, const char *, void *);
 
-#endif /* <netinet/in.h> sparse */
+#endif /* <netinet/in.h> */

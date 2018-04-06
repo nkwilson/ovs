@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2009, 2010, 2011, 2013 Nicira, Inc.
+/* Copyright (c) 2008, 2009, 2010, 2011, 2013, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -101,6 +101,14 @@ uuid_generate(struct uuid *uuid)
     uuid_set_bits_v4(uuid);
 }
 
+struct uuid
+uuid_random(void)
+{
+    struct uuid uuid;
+    uuid_generate(&uuid);
+    return uuid;
+}
+
 void
 uuid_set_bits_v4(struct uuid *uuid)
 {
@@ -115,7 +123,7 @@ uuid_set_bits_v4(struct uuid *uuid)
 void
 uuid_zero(struct uuid *uuid)
 {
-    uuid->parts[0] = uuid->parts[1] = uuid->parts[2] = uuid->parts[3] = 0;
+    *uuid = UUID_ZERO;
 }
 
 /* Returns true if 'uuid' is all zero, otherwise false. */
@@ -209,6 +217,49 @@ uuid_from_string_prefix(struct uuid *uuid, const char *s)
 error:
     uuid_zero(uuid);
     return false;
+}
+
+/* If 's' is a string representation of a UUID, or the beginning of one,
+ * returns strlen(s), otherwise 0.
+ *
+ * For example:
+ *
+ *     "123" yields 3
+ *     "xyzzy" yields 0
+ *     "123xyzzy" yields 0
+ *     "e66250bb-9531-491b-b9c3-5385cabb0080" yields 36
+ *     "e66250bb-9531-491b-b9c3-5385cabb0080xyzzy" yields 0
+ */
+int
+uuid_is_partial_string(const char *s)
+{
+    static const char tmpl[UUID_LEN] = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
+    size_t i;
+    for (i = 0; i < UUID_LEN; i++) {
+        if (s[i] == '\0') {
+            return i;
+        } else if (tmpl[i] == 'x'
+                   ? hexit_value(s[i]) < 0
+                   : s[i] != '-') {
+            return 0;
+        }
+    }
+    if (s[i] != '\0') {
+        return 0;
+    }
+    return i;
+}
+
+/* Compares 'match' to the string representation of 'uuid'.  If 'match' equals
+ * or is a prefix of this string representation, returns strlen(match);
+ * otherwise, returns 0. */
+int
+uuid_is_partial_match(const struct uuid *uuid, const char *match)
+{
+    char uuid_s[UUID_LEN + 1];
+    snprintf(uuid_s, sizeof uuid_s, UUID_FMT, UUID_ARGS(uuid));
+    size_t match_len = strlen(match);
+    return !strncmp(uuid_s, match, match_len) ? match_len : 0;
 }
 
 static void

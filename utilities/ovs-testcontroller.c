@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2015, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,21 +29,21 @@
 #include "daemon.h"
 #include "fatal-signal.h"
 #include "learning-switch.h"
-#include "ofp-parse.h"
 #include "ofp-version-opt.h"
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
 #include "openflow/openflow.h"
-#include "poll-loop.h"
-#include "rconn.h"
+#include "openvswitch/poll-loop.h"
+#include "openvswitch/rconn.h"
 #include "simap.h"
 #include "stream-ssl.h"
 #include "timeval.h"
 #include "unixctl.h"
 #include "util.h"
+#include "openvswitch/ofp-flow.h"
 #include "openvswitch/vconn.h"
 #include "openvswitch/vlog.h"
 #include "socket-util.h"
-#include "ofp-util.h"
+
 
 VLOG_DEFINE_THIS_MODULE(controller);
 
@@ -105,8 +105,11 @@ main(int argc, char *argv[])
 
     ovs_cmdl_proctitle_init(argc, argv);
     set_program_name(argv[0]);
+    service_start(&argc, &argv);
     parse_options(argc, argv);
     fatal_ignore_sigpipe();
+
+    daemon_become_new_user(false);
 
     if (argc - optind < 1) {
         ovs_fatal(0, "at least one vconn argument required; "
@@ -145,7 +148,7 @@ main(int argc, char *argv[])
         ovs_fatal(0, "no active or passive switch connections");
     }
 
-    daemonize_start();
+    daemonize_start(false);
 
     retval = unixctl_server_create(unixctl_path, &unixctl);
     if (retval) {
@@ -256,7 +259,8 @@ parse_options(int argc, char *argv[])
         OPT_UNIXCTL,
         VLOG_OPTION_ENUMS,
         DAEMON_OPTION_ENUMS,
-        OFP_VERSION_OPTION_ENUMS
+        OFP_VERSION_OPTION_ENUMS,
+        SSL_OPTION_ENUMS,
     };
     static const struct option long_options[] = {
         {"hub",         no_argument, NULL, 'H'},
@@ -331,8 +335,8 @@ parse_options(int argc, char *argv[])
             break;
 
         case OPT_WITH_FLOWS:
-            error = parse_ofp_flow_mod_file(optarg, OFPFC_ADD, &default_flows,
-                                            &n_default_flows,
+            error = parse_ofp_flow_mod_file(optarg, NULL, NULL, OFPFC_ADD,
+                                            &default_flows, &n_default_flows,
                                             &usable_protocols);
             if (error) {
                 ovs_fatal(0, "%s", error);

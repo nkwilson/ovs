@@ -74,12 +74,11 @@ ErrorControl    = 1 ;SERVICE_ERROR_NORMAL
 ServiceBinary   = %12%\OVSExt.sys
 LoadOrderGroup  = NDIS
 Description     = %OVSExt_Desc%
-AddReg          = Common.Params.reg
 
 [Install.Remove.Services]
 DelService=OVSExt,0x200
 
 [Strings]
-OVS = "Open vSwitch"
+OVS = "The Linux Foundation (R)"
 OVSExt_Desc = "Open vSwitch Extension"
 OVSExt_HelpText = "Open vSwitch forwarding switch extension"

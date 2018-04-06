@@ -15,22 +15,22 @@
  */
 
 #include <config.h>
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include "coverage.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
-#include "list.h"
+#include "openvswitch/list.h"
 #include "ovs-thread.h"
 #include "seq.h"
 #include "socket-util.h"
 #include "timeval.h"
 #include "openvswitch/vlog.h"
-#include "hmap.h"
+#include "openvswitch/hmap.h"
 #include "hash.h"
 
 VLOG_DEFINE_THIS_MODULE(poll_loop);
@@ -57,16 +57,20 @@ struct poll_loop {
 
 static struct poll_loop *poll_loop(void);
 
-/* Look up the node with same fd and wevent. */
+/* Look up the node with same fd or wevent. */
 static struct poll_node *
 find_poll_node(struct poll_loop *loop, int fd, HANDLE wevent)
 {
     struct poll_node *node;
 
+    /* Both 'fd' and 'wevent' cannot be set. */
+    ovs_assert(!fd != !wevent);
+
     HMAP_FOR_EACH_WITH_HASH (node, hmap_node,
                              hash_2words(fd, (uint32_t)wevent),
                              &loop->poll_nodes) {
-        if (node->pollfd.fd == fd && node->wevent == wevent) {
+        if ((fd && node->pollfd.fd == fd)
+            || (wevent && node->wevent == wevent)) {
             return node;
         }
     }
@@ -249,7 +253,9 @@ log_wakeup(const char *where, const struct pollfd *pollfd, int timeout)
     cpu_usage = get_cpu_usage();
     if (VLOG_IS_DBG_ENABLED()) {
         level = VLL_DBG;
-    } else if (cpu_usage > 50 && !VLOG_DROP_INFO(&rl)) {
+    } else if (cpu_usage > 50
+               && !thread_is_pmd()
+               && !VLOG_DROP_INFO(&rl)) {
         level = VLL_INFO;
     } else {
         return;

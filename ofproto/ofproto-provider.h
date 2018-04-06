@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2009-2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,23 +38,35 @@
 #include "guarded-list.h"
 #include "heap.h"
 #include "hindex.h"
-#include "list.h"
-#include "ofp-actions.h"
-#include "ofp-errors.h"
-#include "ofp-util.h"
+#include "object-collection.h"
 #include "ofproto/ofproto.h"
+#include "openvswitch/list.h"
+#include "openvswitch/ofp-actions.h"
+#include "openvswitch/ofp-errors.h"
+#include "openvswitch/ofp-flow.h"
+#include "openvswitch/ofp-group.h"
+#include "openvswitch/ofp-meter.h"
+#include "openvswitch/ofp-port.h"
+#include "openvswitch/ofp-switch.h"
+#include "openvswitch/ofp-table.h"
 #include "ovs-atomic.h"
 #include "ovs-rcu.h"
 #include "ovs-thread.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "simap.h"
 #include "timeval.h"
+#include "tun-metadata.h"
+#include "versions.h"
+#include "vl-mff-map.h"
 
 struct match;
 struct ofputil_flow_mod;
+struct ofputil_packet_in_private;
 struct bfd_cfg;
 struct meter;
 struct ofoperation;
+struct ofproto_packet_out;
+struct smap;
 
 extern struct ovs_mutex ofproto_mutex;
 
@@ -78,7 +90,7 @@ struct ofproto {
     char *sw_desc;              /* Software version (NULL for default). */
     char *serial_desc;          /* Serial number (NULL for default). */
     char *dp_desc;              /* Datapath description (NULL for default). */
-    enum ofp_config_flags frag_handling; /* One of OFPC_*.  */
+    enum ofputil_frag_handling frag_handling;
 
     /* Datapath. */
     struct hmap ports;          /* Contains "struct ofport"s. */
@@ -93,7 +105,7 @@ struct ofproto {
     long long int eviction_group_timer; /* For rate limited reheapification. */
     struct oftable *tables;
     int n_tables;
-    cls_version_t tables_version;  /* Controls which rules are visible to
+    ovs_version_t tables_version;  /* Controls which rules are visible to
                                     * table lookups. */
 
     /* Rules indexed on their cookie values, in all flow tables. */
@@ -103,39 +115,30 @@ struct ofproto {
     /* List of expirable flows, in all flow tables. */
     struct ovs_list expirable OVS_GUARDED_BY(ofproto_mutex);
 
-    /* Meter table.
-     * OpenFlow meters start at 1.  To avoid confusion we leave the first
-     * pointer in the array un-used, and index directly with the OpenFlow
-     * meter_id. */
+    /* Meter table.  */
     struct ofputil_meter_features meter_features;
-    struct meter **meters; /* 'meter_features.max_meter' + 1 pointers. */
+    struct hmap meters;             /* uint32_t indexed 'struct meter *'.  */
+    uint32_t slowpath_meter_id;     /* Datapath slowpath meter.  UINT32_MAX
+                                       if not defined.  */
+    uint32_t controller_meter_id;   /* Datapath controller meter. UINT32_MAX
+                                       if not defined.  */
 
     /* OpenFlow connections. */
     struct connmgr *connmgr;
 
-    /* Delayed rule executions.
-     *
-     * We delay calls to ->ofproto_class->rule_execute() past releasing
-     * ofproto_mutex during a flow_mod, because otherwise a "learn" action
-     * triggered by the executing the packet would try to recursively modify
-     * the flow table and reacquire the global lock. */
-    struct guarded_list rule_executes; /* Contains "struct rule_execute"s. */
-
-    /* Linux VLAN device support (e.g. "eth0.10" for VLAN 10.)
-     *
-     * This is deprecated.  It is only for compatibility with broken device
-     * drivers in old versions of Linux that do not properly support VLANs when
-     * VLAN devices are not used.  When broken device drivers are no longer in
-     * widespread use, we will delete these interfaces. */
-    unsigned long int *vlan_bitmap; /* 4096-bit bitmap of in-use VLANs. */
-    bool vlans_changed;             /* True if new VLANs are in use. */
     int min_mtu;                    /* Current MTU of non-internal ports. */
 
     /* Groups. */
-    struct ovs_rwlock groups_rwlock;
-    struct hmap groups OVS_GUARDED;   /* Contains "struct ofgroup"s. */
+    struct cmap groups;               /* Contains "struct ofgroup"s. */
     uint32_t n_groups[4] OVS_GUARDED; /* # of existing groups of each type. */
     struct ofputil_group_features ogf;
+
+     /* Tunnel TLV mapping table. */
+     OVSRCU_TYPE(struct tun_table *) metadata_tab;
+
+    /* Variable length mf_field mapping. Stores all configured variable length
+     * meta-flow fields (struct mf_field) in a switch. */
+    struct vl_mff_map vl_mff_map;
 };
 
 void ofproto_init_tables(struct ofproto *, int n_tables);
@@ -256,6 +259,18 @@ struct oftable {
 #define EVICTION_OPENFLOW (1 << 1) /* Set to 1 if OpenFlow enables eviction. */
     unsigned int eviction;
 
+    /* If zero, vacancy events are disabled.  If nonzero, this is the type of
+       vacancy event that is enabled: either OFPTR_VACANCY_DOWN or
+       OFPTR_VACANCY_UP.  Only one type of vacancy event can be enabled at a
+       time. */
+    enum ofp14_table_reason vacancy_event;
+
+    /* Non-zero values for vacancy_up and vacancy_down indicates that vacancy
+     * is enabled by table-mod, else these values are set to zero when
+     * vacancy is disabled */
+    uint8_t vacancy_down; /* Vacancy threshold when space decreases (%). */
+    uint8_t vacancy_up;   /* Vacancy threshold when space increases (%). */
+
     atomic_ulong n_matched;
     atomic_ulong n_missed;
 };
@@ -326,6 +341,19 @@ struct oftable {
  *      'rule->mutex', and safely written only by coding holding ofproto_mutex
  *      AND 'rule->mutex'.  These are marked OVS_GUARDED.
  */
+enum OVS_PACKED_ENUM rule_state {
+    RULE_INITIALIZED, /* Rule has been initialized, but not inserted to the
+                       * ofproto data structures.  Versioning makes sure the
+                       * rule is not visible to lookups by other threads, even
+                       * if the rule is added to a classifier. */
+    RULE_INSERTED,    /* Rule has been inserted to ofproto data structures and
+                       * may be visible to lookups by other threads. */
+    RULE_REMOVED,     /* Rule has been removed from ofproto data structures,
+                       * and may still be visible to lookups by other threads
+                       * until they quiesce, after which the rule will be
+                       * removed from the classifier as well. */
+};
+
 struct rule {
     /* Where this rule resides in an OpenFlow switch.
      *
@@ -333,8 +361,8 @@ struct rule {
     struct ofproto *const ofproto; /* The ofproto that contains this rule. */
     const struct cls_rule cr;      /* In owning ofproto's classifier. */
     const uint8_t table_id;        /* Index in ofproto's 'tables' array. */
-    bool removed;                  /* Rule has been removed from the ofproto
-                                    * data structures. */
+
+    enum rule_state state;
 
     /* Protects members marked OVS_GUARDED.
      * Readers only need to hold this mutex.
@@ -350,8 +378,8 @@ struct rule {
     struct ovs_refcount ref_count;
 
     /* A "flow cookie" is the OpenFlow name for a 64-bit value associated with
-     * a flow.. */
-    ovs_be64 flow_cookie OVS_GUARDED;
+     * a flow. */
+    const ovs_be64 flow_cookie; /* Immutable once rule is constructed. */
     struct hindex_node cookie_node OVS_GUARDED_BY(ofproto_mutex);
 
     enum ofputil_flow_mod_flags flags OVS_GUARDED;
@@ -402,6 +430,10 @@ struct rule {
 
     /* Must hold 'mutex' for both read/write, 'ofproto_mutex' not needed. */
     long long int modified OVS_GUARDED; /* Time of last modification. */
+
+    /* 1-bit for each present TLV in flow match / action. */
+    uint64_t match_tlv_bitmap;
+    uint64_t ofpacts_tlv_bitmap;
 };
 
 void ofproto_rule_ref(struct rule *);
@@ -433,6 +465,7 @@ struct rule_actions {
      * action whose flags include NX_LEARN_F_DELETE_LEARNED. */
     bool has_meter;
     bool has_learn_with_delete;
+    bool has_groups;
 
     /* Actions. */
     uint32_t ofpacts_len;         /* Size of 'ofpacts', in bytes. */
@@ -445,20 +478,39 @@ void rule_actions_destroy(const struct rule_actions *);
 bool ofproto_rule_has_out_port(const struct rule *, ofp_port_t port)
     OVS_REQUIRES(ofproto_mutex);
 
-/* A set of rules to which an OpenFlow operation applies. */
-struct rule_collection {
-    struct rule **rules;        /* The rules. */
-    size_t n;                   /* Number of rules collected. */
+#define DECL_OFPROTO_COLLECTION(TYPE, NAME)                             \
+    DECL_OBJECT_COLLECTION(TYPE, NAME)                                  \
+static inline void NAME##_collection_ref(struct NAME##_collection *coll)   \
+{                                                                       \
+    for (size_t i = 0; i < coll->collection.n; i++) {                   \
+        ofproto_##NAME##_ref((TYPE)coll->collection.objs[i]);           \
+    }                                                                   \
+}                                                                       \
+                                                                        \
+static inline void NAME##_collection_unref(struct NAME##_collection *coll) \
+{                                                                       \
+    for (size_t i = 0; i < coll->collection.n; i++) {                   \
+        ofproto_##NAME##_unref((TYPE)coll->collection.objs[i]);         \
+    }                                                                   \
+}
 
-    size_t capacity;            /* Number of rules that will fit in 'rules'. */
-    struct rule *stub[64];      /* Preallocated rules to avoid malloc(). */
-};
+DECL_OFPROTO_COLLECTION (struct rule *, rule)
 
-void rule_collection_init(struct rule_collection *);
-void rule_collection_add(struct rule_collection *, struct rule *);
-void rule_collection_ref(struct rule_collection *) OVS_REQUIRES(ofproto_mutex);
-void rule_collection_unref(struct rule_collection *);
-void rule_collection_destroy(struct rule_collection *);
+#define RULE_COLLECTION_FOR_EACH(RULE, RULES)                           \
+    for (size_t i__ = 0;                                                \
+         i__ < rule_collection_n(RULES)                                 \
+             ? (RULE = rule_collection_rules(RULES)[i__]) != NULL : false; \
+         i__++)
+
+/* Pairwise iteration through two rule collections that must be of the same
+ * size. */
+#define RULE_COLLECTIONS_FOR_EACH(RULE1, RULE2, RULES1, RULES2)        \
+    for (size_t i__ = 0;                                               \
+         i__ < rule_collection_n(RULES1)                               \
+             ? ((RULE1 = rule_collection_rules(RULES1)[i__]),          \
+                (RULE2 = rule_collection_rules(RULES2)[i__]) != NULL)  \
+             : false;                                                  \
+         i__++)
 
 /* Limits the number of flows allowed in the datapath. Only affects the
  * ofproto-dpif implementation. */
@@ -473,28 +525,28 @@ extern unsigned ofproto_max_idle;
  * ofproto-dpif implementation. */
 extern size_t n_handlers, n_revalidators;
 
-/* Number of rx queues to be created for each dpdk interface. */
-extern size_t n_dpdk_rxqs;
-
-/* Cpu mask for pmd threads. */
-extern char *pmd_cpu_mask;
-
 static inline struct rule *rule_from_cls_rule(const struct cls_rule *);
 
 void ofproto_rule_expire(struct rule *rule, uint8_t reason)
     OVS_REQUIRES(ofproto_mutex);
 void ofproto_rule_delete(struct ofproto *, struct rule *)
     OVS_EXCLUDED(ofproto_mutex);
+void ofproto_rule_reduce_timeouts__(struct rule *rule, uint16_t idle_timeout,
+                                    uint16_t hard_timeout)
+    OVS_REQUIRES(ofproto_mutex) OVS_EXCLUDED(rule->mutex);
 void ofproto_rule_reduce_timeouts(struct rule *rule, uint16_t idle_timeout,
                                   uint16_t hard_timeout)
     OVS_EXCLUDED(ofproto_mutex);
 
-/* A group within a "struct ofproto".
+/* A group within a "struct ofproto", RCU-protected.
  *
  * With few exceptions, ofproto implementations may look at these fields but
  * should not modify them. */
 struct ofgroup {
-    struct hmap_node hmap_node OVS_GUARDED; /* In ofproto's "groups" hmap. */
+    struct cmap_node cmap_node; /* In ofproto's "groups" cmap. */
+
+    /* Group versioning. */
+    struct versions versions;
 
     /* Number of references.
      *
@@ -509,26 +561,50 @@ struct ofgroup {
 
     /* No lock is needed to protect the fields below since they are not
      * modified after construction. */
-    const struct ofproto *ofproto;  /* The ofproto that contains this group. */
+    struct ofproto * const ofproto;  /* The ofproto that contains this group. */
     const uint32_t group_id;
     const enum ofp11_group_type type; /* One of OFPGT_*. */
+    bool being_deleted;               /* Group removal has begun. */
 
     const long long int created;      /* Creation time. */
     const long long int modified;     /* Time of last modification. */
 
-    struct ovs_list buckets;        /* Contains "struct ofputil_bucket"s. */
+    const struct ovs_list buckets;    /* Contains "struct ofputil_bucket"s. */
     const uint32_t n_buckets;
 
     const struct ofputil_group_props props;
+
+    struct rule_collection rules OVS_GUARDED;   /* Referring rules. */
 };
 
-bool ofproto_group_lookup(const struct ofproto *ofproto, uint32_t group_id,
-                          struct ofgroup **group);
+struct ofgroup *ofproto_group_lookup(const struct ofproto *ofproto,
+                                     uint32_t group_id, ovs_version_t version,
+                                     bool take_ref);
 
 void ofproto_group_ref(struct ofgroup *);
+bool ofproto_group_try_ref(struct ofgroup *);
 void ofproto_group_unref(struct ofgroup *);
 
-void ofproto_group_delete_all(struct ofproto *);
+void ofproto_group_delete_all(struct ofproto *)
+    OVS_EXCLUDED(ofproto_mutex);
+
+DECL_OFPROTO_COLLECTION (struct ofgroup *, group)
+
+#define GROUP_COLLECTION_FOR_EACH(GROUP, GROUPS)                        \
+    for (size_t i__ = 0;                                                \
+         i__ < group_collection_n(GROUPS)                               \
+             ? (GROUP = group_collection_groups(GROUPS)[i__]) != NULL: false; \
+         i__++)
+
+/* Pairwise iteration through two group collections that must be of the same
+ * size. */
+#define GROUP_COLLECTIONS_FOR_EACH(GROUP1, GROUP2, GROUPS1, GROUPS2)    \
+    for (size_t i__ = 0;                                                \
+         i__ < group_collection_n(GROUPS1)                              \
+             ? ((GROUP1 = group_collection_groups(GROUPS1)[i__]),       \
+                (GROUP2 = group_collection_groups(GROUPS2)[i__]) != NULL) \
+             : false;                                                   \
+         i__++)
 
 /* ofproto class structure, to be defined by each ofproto implementation.
  *
@@ -619,7 +695,7 @@ void ofproto_group_delete_all(struct ofproto *);
  * not yet been uninitialized, so the "destruct" function may refer to it.  The
  * "destruct" function is not allowed to fail.
  *
- * Each "dealloc" function frees raw memory that was allocated by the the
+ * Each "dealloc" function frees raw memory that was allocated by the
  * "alloc" function.  The memory's base and derived members might not have ever
  * been initialized (but if "construct" returned successfully, then it has been
  * "destruct"ed already).  The "dealloc" function is not allowed to fail.
@@ -759,7 +835,7 @@ struct ofproto_class {
      */
     struct ofproto *(*alloc)(void);
     int (*construct)(struct ofproto *ofproto);
-    void (*destruct)(struct ofproto *ofproto);
+    void (*destruct)(struct ofproto *ofproto, bool del);
     void (*dealloc)(struct ofproto *ofproto);
 
     /* Performs any periodic activity required by 'ofproto'.  It should:
@@ -857,8 +933,11 @@ struct ofproto_class {
                          struct ofputil_table_stats *stats);
 
     /* Sets the current tables version the provider should use for classifier
-     * lookups. */
-    void (*set_tables_version)(struct ofproto *ofproto, cls_version_t version);
+     * lookups.  This must be called with a new version number after each set
+     * of flow table changes has been completed, so that datapath revalidation
+     * can be triggered. */
+    void (*set_tables_version)(struct ofproto *ofproto, ovs_version_t version);
+
 /* ## ---------------- ## */
 /* ## ofport Functions ## */
 /* ## ---------------- ## */
@@ -890,12 +969,36 @@ struct ofproto_class {
      *     initialization, and construct and destruct ofports to reflect all of
      *     the changes.
      *
+     *   - On graceful shutdown, the base ofproto code will destruct all
+     *     the ports.
+     *
      * ->port_construct() returns 0 if successful, otherwise a positive errno
      * value.
+     *
+     *
+     * ->port_destruct()
+     * =================
+     *
+     * ->port_destruct() takes a 'del' parameter.  If the provider implements
+     * the datapath itself (e.g. dpif-netdev, it can ignore 'del'.  On the
+     * other hand, if the provider is an interface to an external datapath
+     * (e.g. to a kernel module that implement the datapath) then 'del' should
+     * influence destruction behavior in the following way:
+     *
+     *   - If 'del' is true, it should remove the port from the underlying
+     *     implementation.  This is the common case.
+     *
+     *   - If 'del' is false, it should leave the port in the underlying
+     *     implementation.  This is used when Open vSwitch is performing a
+     *     graceful shutdown and ensures that, across Open vSwitch restarts,
+     *     the underlying ports are not removed and recreated.  That makes an
+     *     important difference for, e.g., "internal" ports that have
+     *     configured IP addresses; without this distinction, the IP address
+     *     and other configured state for the port is lost.
      */
     struct ofport *(*port_alloc)(void);
     int (*port_construct)(struct ofport *ofport);
-    void (*port_destruct)(struct ofport *ofport);
+    void (*port_destruct)(struct ofport *ofport, bool del);
     void (*port_dealloc)(struct ofport *ofport);
 
     /* Called after 'ofport->netdev' is replaced by a new netdev object.  If
@@ -943,6 +1046,10 @@ struct ofproto_class {
      * to ->port_poll(); the implementation may do whatever is more
      * convenient. */
     int (*port_del)(struct ofproto *ofproto, ofp_port_t ofp_port);
+
+    /* Refreshes datapath configuration of 'port'.
+     * Returns 0 if successful, otherwise a positive errno value. */
+    int (*port_set_config)(const struct ofport *port, const struct smap *cfg);
 
     /* Get port stats */
     int (*port_get_stats)(const struct ofport *port,
@@ -1092,7 +1199,7 @@ struct ofproto_class {
      *
      * If this function is NULL then table 0 is always chosen. */
     enum ofperr (*rule_choose_table)(const struct ofproto *ofproto,
-                                     const struct match *match,
+                                     const struct minimatch *match,
                                      uint8_t *table_idp);
 
     /* Life-cycle functions for a "struct rule".
@@ -1165,16 +1272,18 @@ struct ofproto_class {
      * must add the new rule to the datapath flow table and return only after
      * this is complete.  The 'new_rule' may be a duplicate of an 'old_rule'.
      * In this case the 'old_rule' is non-null, and the implementation should
-     * forward rule statistics from the 'old_rule' to the 'new_rule' if
-     * 'forward_stats' is 'true'.  This may not fail.
+     * forward rule statistics counts from the 'old_rule' to the 'new_rule' if
+     * 'forward_counts' is 'true', 'used' timestamp is always forwarded.  This
+     * may not fail.
      *
      *
      * Deletion
      * ========
      *
      * The ofproto base code removes 'rule' from its flow table before it calls
-     * ->rule_delete().  ->rule_delete() must remove 'rule' from the datapath
-     * flow table and return only after this has completed successfully.
+     * ->rule_delete() (if non-null).  ->rule_delete() must remove 'rule' from
+     * the datapath flow table and return only after this has completed
+     * successfully.
      *
      * Rule deletion must not fail.
      *
@@ -1189,7 +1298,7 @@ struct ofproto_class {
     enum ofperr (*rule_construct)(struct rule *rule)
         /* OVS_REQUIRES(ofproto_mutex) */;
     void (*rule_insert)(struct rule *rule, struct rule *old_rule,
-                        bool forward_stats)
+                        bool forward_counts)
         /* OVS_REQUIRES(ofproto_mutex) */;
     void (*rule_delete)(struct rule *rule) /* OVS_REQUIRES(ofproto_mutex) */;
     void (*rule_destruct)(struct rule *rule);
@@ -1203,45 +1312,55 @@ struct ofproto_class {
                            uint64_t *byte_count, long long int *used)
         /* OVS_EXCLUDED(ofproto_mutex) */;
 
-    /* Applies the actions in 'rule' to 'packet'.  (This implements sending
-     * buffered packets for OpenFlow OFPT_FLOW_MOD commands.)
+    /* Translates actions in 'opo->ofpacts', for 'opo->packet' in flow tables
+     * in version 'opo->version'.  This is useful for OpenFlow OFPT_PACKET_OUT.
      *
-     * Takes ownership of 'packet' (so it should eventually free it, with
-     * ofpbuf_delete()).
+     * This function must validate that it can correctly translate
+     * 'opo->ofpacts'.  If not, then it should return an OpenFlow error code.
      *
-     * 'flow' reflects the flow information for 'packet'.  All of the
-     * information in 'flow' is extracted from 'packet', except for
-     * flow->tunnel and flow->in_port, which are assigned the correct values
-     * for the incoming packet.  The register values are zeroed.  'packet''s
+     * 'opo->flow' reflects the flow information for 'opo->packet'.  All of the
+     * information in 'opo->flow' is extracted from 'opo->packet', except for
+     * 'in_port', which is assigned to the correct value for the incoming
+     * packet.  'tunnel' and register values should be zeroed.  'packet''s
      * header pointers and offsets (e.g. packet->l3) are appropriately
      * initialized.  packet->l3 is aligned on a 32-bit boundary.
      *
-     * The implementation should add the statistics for 'packet' into 'rule'.
+     * Returns 0 if successful, otherwise an OpenFlow error code.
      *
-     * Returns 0 if successful, otherwise an OpenFlow error code. */
-    enum ofperr (*rule_execute)(struct rule *rule, const struct flow *flow,
-                                struct dp_packet *packet);
+     * This function may be called with 'ofproto_mutex' held. */
+    enum ofperr (*packet_xlate)(struct ofproto *,
+                                struct ofproto_packet_out *opo);
+
+    /* Free resources taken by a successful packet_xlate().  If multiple
+     * packet_xlate() calls have been made in sequence, the corresponding
+     * packet_xlate_revert() calls have to be made in reverse order. */
+    void (*packet_xlate_revert)(struct ofproto *, struct ofproto_packet_out *);
+
+    /* Executes the datapath actions, translation side-effects, and stats as
+     * produced by ->packet_xlate().  The caller retains ownership of 'opo'.
+     */
+    void (*packet_execute)(struct ofproto *, struct ofproto_packet_out *opo);
 
     /* Changes the OpenFlow IP fragment handling policy to 'frag_handling',
      * which takes one of the following values, with the corresponding
      * meanings:
      *
-     *  - OFPC_FRAG_NORMAL: The switch should treat IP fragments the same way
-     *    as other packets, omitting TCP and UDP port numbers (always setting
-     *    them to 0).
+     *  - OFPUTIL_FRAG_NORMAL: The switch should treat IP fragments the same
+     *    way as other packets, omitting TCP and UDP port numbers (always
+     *    setting them to 0).
      *
-     *  - OFPC_FRAG_DROP: The switch should drop all IP fragments without
+     *  - OFPUTIL_FRAG_DROP: The switch should drop all IP fragments without
      *    passing them through the flow table.
      *
-     *  - OFPC_FRAG_REASM: The switch should reassemble IP fragments before
+     *  - OFPUTIL_FRAG_REASM: The switch should reassemble IP fragments before
      *    passing packets through the flow table.
      *
-     *  - OFPC_FRAG_NX_MATCH (a Nicira extension): Similar to OFPC_FRAG_NORMAL,
-     *    except that TCP and UDP port numbers should be included in fragments
-     *    with offset 0.
+     *  - OFPUTIL_FRAG_NX_MATCH (a Nicira extension): Similar to
+     *    OFPUTIL_FRAG_NORMAL, except that TCP and UDP port numbers should be
+     *    included in fragments with offset 0.
      *
      * Implementations are not required to support every mode.
-     * OFPC_FRAG_NORMAL is the default mode when an ofproto is created.
+     * OFPUTIL_FRAG_NORMAL is the default mode when an ofproto is created.
      *
      * At the time of the call to ->set_frag_handling(), the current mode is
      * available in 'ofproto->frag_handling'.  ->set_frag_handling() returns
@@ -1251,50 +1370,10 @@ struct ofproto_class {
      * reflect the new mode.
      */
     bool (*set_frag_handling)(struct ofproto *ofproto,
-                              enum ofp_config_flags frag_handling);
+                              enum ofputil_frag_handling frag_handling);
 
-    /* Implements the OpenFlow OFPT_PACKET_OUT command.  The datapath should
-     * execute the 'ofpacts_len' bytes of "struct ofpacts" in 'ofpacts'.
-     *
-     * The caller retains ownership of 'packet' and of 'ofpacts', so
-     * ->packet_out() should not modify or free them.
-     *
-     * This function must validate that it can correctly implement 'ofpacts'.
-     * If not, then it should return an OpenFlow error code.
-     *
-     * 'flow' reflects the flow information for 'packet'.  All of the
-     * information in 'flow' is extracted from 'packet', except for
-     * flow->in_port (see below).  flow->tunnel and its register values are
-     * zeroed.
-     *
-     * flow->in_port comes from the OpenFlow OFPT_PACKET_OUT message.  The
-     * implementation should reject invalid flow->in_port values by returning
-     * OFPERR_OFPBRC_BAD_PORT.  (If the implementation called
-     * ofproto_init_max_ports(), then the client will reject these ports
-     * itself.)  For consistency, the implementation should consider valid for
-     * flow->in_port any value that could possibly be seen in a packet that it
-     * passes to connmgr_send_packet_in().  Ideally, even an implementation
-     * that never generates packet-ins (e.g. due to hardware limitations)
-     * should still allow flow->in_port values for every possible physical port
-     * and OFPP_LOCAL.  The only virtual ports (those above OFPP_MAX) that the
-     * caller will ever pass in as flow->in_port, other than OFPP_LOCAL, are
-     * OFPP_NONE and OFPP_CONTROLLER.  The implementation should allow both of
-     * these, treating each of them as packets generated by the controller as
-     * opposed to packets originating from some switch port.
-     *
-     * (Ordinarily the only effect of flow->in_port is on output actions that
-     * involve the input port, such as actions that output to OFPP_IN_PORT,
-     * OFPP_FLOOD, or OFPP_ALL.  flow->in_port can also affect Nicira extension
-     * "resubmit" actions.)
-     *
-     * 'packet' is not matched against the OpenFlow flow table, so its
-     * statistics should not be included in OpenFlow flow statistics.
-     *
-     * Returns 0 if successful, otherwise an OpenFlow error code. */
-    enum ofperr (*packet_out)(struct ofproto *ofproto, struct dp_packet *packet,
-                              const struct flow *flow,
-                              const struct ofpact *ofpacts,
-                              size_t ofpacts_len);
+    enum ofperr (*nxt_resume)(struct ofproto *ofproto,
+                              const struct ofputil_packet_in_private *);
 
 /* ## ------------------------- ## */
 /* ## OFPP_NORMAL configuration ## */
@@ -1332,6 +1411,16 @@ struct ofproto_class {
             *bridge_exporter_options,
         const struct ofproto_ipfix_flow_exporter_options
             *flow_exporters_options, size_t n_flow_exporters_options);
+
+    /* Gets IPFIX stats on 'ofproto' according to the exporter of birdge
+     * IPFIX or flow-based IPFIX.
+     *
+     * OFPERR_NXST_NOT_CONFIGURED as a return value indicates that bridge
+     * IPFIX or flow-based IPFIX is not configured. */
+    int (*get_ipfix_stats)(
+        const struct ofproto *ofproto,
+        bool bridge_ipfix, struct ovs_list *replies
+        );
 
     /* Configures connectivity fault management on 'ofport'.
      *
@@ -1668,25 +1757,6 @@ struct ofproto_class {
     int (*set_mcast_snooping_port)(struct ofproto *ofproto_, void *aux,
                           const struct ofproto_mcast_snooping_port_settings *s);
 
-/* Linux VLAN device support (e.g. "eth0.10" for VLAN 10.)
- *
- * This is deprecated.  It is only for compatibility with broken device drivers
- * in old versions of Linux that do not properly support VLANs when VLAN
- * devices are not used.  When broken device drivers are no longer in
- * widespread use, we will delete these interfaces. */
-
-    /* If 'realdev_ofp_port' is nonzero, then this function configures 'ofport'
-     * as a VLAN splinter port for VLAN 'vid', associated with the real device
-     * that has OpenFlow port number 'realdev_ofp_port'.
-     *
-     * If 'realdev_ofp_port' is zero, then this function deconfigures 'ofport'
-     * as a VLAN splinter port.
-     *
-     * This function should be NULL if an implementation does not support it.
-     */
-    int (*set_realdev)(struct ofport *ofport,
-                       ofp_port_t realdev_ofp_port, int vid);
-
 /* ## ------------------------ ## */
 /* ## OpenFlow meter functions ## */
 /* ## ------------------------ ## */
@@ -1713,16 +1783,17 @@ struct ofproto_class {
      * leaving '*id' unchanged.  On failure, the existing meter configuration
      * is left intact. */
     enum ofperr (*meter_set)(struct ofproto *ofproto, ofproto_meter_id *id,
-                             const struct ofputil_meter_config *config);
+                             struct ofputil_meter_config *config);
 
     /* Gets the meter and meter band packet and byte counts for maximum of
-     * 'stats->n_bands' bands for the meter with provider ID 'id' within
-     * 'ofproto'.  The caller fills in the other stats values.  The band stats
-     * are copied to memory at 'stats->bands' provided by the caller.  The
-     * number of returned band stats is returned in 'stats->n_bands'. */
+     * 'n_bands' bands for the meter with provider ID 'id' within 'ofproto'.
+     * The caller fills in the other stats values.  The band stats are copied
+     * to memory at 'stats->bands' provided by the caller.  The number of
+     * returned band stats is returned in 'stats->n_bands'. */
     enum ofperr (*meter_get)(const struct ofproto *ofproto,
                              ofproto_meter_id id,
-                             struct ofputil_meter_stats *stats);
+                             struct ofputil_meter_stats *stats,
+                             uint16_t n_bands);
 
     /* Deletes a meter, making the 'ofproto_meter_id' invalid for any
      * further calls. */
@@ -1738,7 +1809,7 @@ struct ofproto_class {
     void (*group_destruct)(struct ofgroup *);
     void (*group_dealloc)(struct ofgroup *);
 
-    enum ofperr (*group_modify)(struct ofgroup *);
+    void (*group_modify)(struct ofgroup *);
 
     enum ofperr (*group_get_stats)(const struct ofgroup *,
                                    struct ofputil_group_stats *);
@@ -1755,6 +1826,20 @@ struct ofproto_class {
      * This function should be NULL if an implementation does not support it.
      */
     const char *(*get_datapath_version)(const struct ofproto *);
+
+    /* Pass custom configuration options to the 'type' datapath.
+     *
+     * This function should be NULL if an implementation does not support it.
+     */
+    void (*type_set_config)(const char *type,
+                            const struct smap *other_config);
+
+/* ## ------------------- ## */
+/* ## Connection tracking ## */
+/* ## ------------------- ## */
+    /* Flushes the connection tracking tables. If 'zone' is not NULL,
+     * only deletes connections in '*zone'. */
+    void (*ct_flush)(const struct ofproto *, const uint16_t *zone);
 };
 
 extern const struct ofproto_class ofproto_dpif_class;
@@ -1762,15 +1847,67 @@ extern const struct ofproto_class ofproto_dpif_class;
 int ofproto_class_register(const struct ofproto_class *);
 int ofproto_class_unregister(const struct ofproto_class *);
 
+/* Criteria that flow_mod and other operations use for selecting rules on
+ * which to operate. */
+struct rule_criteria {
+    /* An OpenFlow table or 255 for all tables. */
+    uint8_t table_id;
+
+    /* OpenFlow matching criteria.  Interpreted different in "loose" way by
+     * collect_rules_loose() and "strict" way by collect_rules_strict(), as
+     * defined in the OpenFlow spec. */
+    struct cls_rule cr;
+    ovs_version_t version;
+
+    /* Matching criteria for the OpenFlow cookie.  Consider a bit B in a rule's
+     * cookie and the corresponding bits C in 'cookie' and M in 'cookie_mask'.
+     * The rule will not be selected if M is 1 and B != C.  */
+    ovs_be64 cookie;
+    ovs_be64 cookie_mask;
+
+    /* Selection based on actions within a rule:
+     *
+     * If out_port != OFPP_ANY, selects only rules that output to out_port.
+     * If out_group != OFPG_ALL, select only rules that output to out_group. */
+    ofp_port_t out_port;
+    uint32_t out_group;
+
+    /* If true, collects only rules that are modifiable. */
+    bool include_hidden;
+    bool include_readonly;
+};
+
 /* flow_mod with execution context. */
 struct ofproto_flow_mod {
-    struct ofputil_flow_mod fm;
+    /* Allocated by 'init' phase, may be freed after 'start' phase, as these
+     * are not needed for 'revert' nor 'finish'.
+     *
+     * This structure owns a reference to 'temp_rule' (if it is nonnull) that
+     * must be eventually be released with ofproto_rule_unref().  */
+    struct rule *temp_rule;
+    struct rule_criteria criteria;
+    struct cls_conjunction *conjs;
+    size_t n_conjs;
 
-    cls_version_t version;              /* Version in which changes take
+    /* Replicate needed fields from ofputil_flow_mod to not need it after the
+     * flow has been created. */
+    uint16_t command;
+    bool modify_cookie;
+    /* Fields derived from ofputil_flow_mod. */
+    bool modify_may_add_flow;
+    bool modify_keep_counts;
+    enum nx_flow_update_event event;
+
+    /* These are only used during commit execution.
+     * ofproto_flow_mod_uninit() does NOT clean these up. */
+    ovs_version_t version;              /* Version in which changes take
                                          * effect. */
+    bool learn_adds_rule;               /* Learn execution adds a rule. */
     struct rule_collection old_rules;   /* Affected rules. */
     struct rule_collection new_rules;   /* Replacement rules. */
 };
+
+void ofproto_flow_mod_uninit(struct ofproto_flow_mod *);
 
 /* port_mod with execution context. */
 struct ofproto_port_mod {
@@ -1778,15 +1915,57 @@ struct ofproto_port_mod {
     struct ofport *port;                /* Affected port. */
 };
 
-enum ofperr ofproto_flow_mod(struct ofproto *, struct ofproto_flow_mod *)
+/* flow_mod with execution context. */
+struct ofproto_group_mod {
+    struct ofputil_group_mod gm;
+
+    ovs_version_t version;              /* Version in which changes take
+                                         * effect. */
+    struct ofgroup *new_group;          /* New group. */
+    struct group_collection old_groups; /* Affected groups. */
+};
+
+/* packet_out with execution context. */
+struct ofproto_packet_out {
+    ovs_version_t version;
+    struct dp_packet *packet;
+    struct flow *flow;
+    struct ofpact *ofpacts;
+    size_t ofpacts_len;
+
+    void *aux;   /* Provider private. */
+};
+
+void ofproto_packet_out_uninit(struct ofproto_packet_out *);
+
+enum ofperr ofproto_flow_mod(struct ofproto *, const struct ofputil_flow_mod *)
     OVS_EXCLUDED(ofproto_mutex);
+enum ofperr ofproto_flow_mod_init_for_learn(struct ofproto *,
+                                            const struct ofputil_flow_mod *,
+                                            struct ofproto_flow_mod *)
+    OVS_EXCLUDED(ofproto_mutex);
+enum ofperr ofproto_flow_mod_learn(struct ofproto_flow_mod *, bool keep_ref,
+                                   unsigned limit, bool *below_limit)
+    OVS_EXCLUDED(ofproto_mutex);
+enum ofperr ofproto_flow_mod_learn_refresh(struct ofproto_flow_mod *ofm);
+enum ofperr ofproto_flow_mod_learn_start(struct ofproto_flow_mod *ofm)
+    OVS_REQUIRES(ofproto_mutex);
+void ofproto_flow_mod_learn_revert(struct ofproto_flow_mod *ofm)
+    OVS_REQUIRES(ofproto_mutex);
+void ofproto_flow_mod_learn_finish(struct ofproto_flow_mod *ofm,
+                                          struct ofproto *orig_ofproto)
+    OVS_REQUIRES(ofproto_mutex);
 void ofproto_add_flow(struct ofproto *, const struct match *, int priority,
                       const struct ofpact *ofpacts, size_t ofpacts_len)
     OVS_EXCLUDED(ofproto_mutex);
 void ofproto_delete_flow(struct ofproto *, const struct match *, int priority)
-    OVS_EXCLUDED(ofproto_mutex);
+    OVS_REQUIRES(ofproto_mutex);
 void ofproto_flush_flows(struct ofproto *);
 
+enum ofperr ofproto_check_ofpacts(struct ofproto *,
+                                  const struct ofpact ofpacts[],
+                                  size_t ofpacts_len)
+    OVS_REQUIRES(ofproto_mutex);
 
 static inline const struct rule_actions *
 rule_get_actions(const struct rule *rule)
@@ -1821,6 +2000,12 @@ static inline struct rule *
 rule_from_cls_rule(const struct cls_rule *cls_rule)
 {
     return cls_rule ? CONTAINER_OF(cls_rule, struct rule, cr) : NULL;
+}
+
+static inline const struct tun_table *
+ofproto_get_tun_tab(const struct ofproto *ofproto)
+{
+    return ovsrcu_get(struct tun_table *, &ofproto->metadata_tab);
 }
 
 #endif /* ofproto/ofproto-provider.h */

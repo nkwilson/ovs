@@ -1,6 +1,6 @@
 # -*- autoconf -*-
 
-# Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+# Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-m4_include([m4/compat.at])
+m4_include([m4/compat.m4])
 
 dnl Checks for --enable-coverage and updates CFLAGS and LDFLAGS appropriately.
 AC_DEFUN([OVS_CHECK_COVERAGE],
@@ -70,6 +70,25 @@ AC_DEFUN([OVS_CHECK_ESX],
       AC_DEFINE([ESX], [1], [Define to 1 if building on ESX.])
    fi])
 
+dnl Checks for MSVC x64 compiler.
+AC_DEFUN([OVS_CHECK_WIN64],
+  [AC_CACHE_CHECK(
+    [for MSVC x64 compiler],
+    [cl_cv_x64],
+    [dnl "cl" writes x64 output to stdin:
+     if (cl) 2>&1 | grep 'x64' >/dev/null 2>&1; then
+       cl_cv_x64=yes
+       MSVC64_LDFLAGS=" /MACHINE:X64 "
+       MSVC_PLATFORM="x64"
+     else
+       cl_cv_x64=no
+       MSVC64_LDFLAGS=""
+       MSVC_PLATFORM="x86"
+     fi])
+     AC_SUBST([MSVC64_LDFLAGS])
+     AC_SUBST([MSVC_PLATFORM])
+])
+
 dnl Checks for WINDOWS.
 AC_DEFUN([OVS_CHECK_WIN32],
   [AC_CHECK_HEADER([windows.h],
@@ -86,11 +105,24 @@ AC_DEFUN([OVS_CHECK_WIN32],
             AC_MSG_ERROR([Invalid --with-pthread value])
               ;;
             *)
-            PTHREAD_WIN32_DIR=$withval/lib/x86
-            PTHREAD_WIN32_DIR_DLL=/${withval/:/}/dll/x86
+            if (cl) 2>&1 | grep 'x64' >/dev/null 2>&1; then
+              cl_cv_x64=yes
+            else
+              cl_cv_x64=no
+            fi
+            if test "$cl_cv_x64" = yes; then
+                PTHREAD_WIN32_DIR=$withval/lib/x64
+                PTHREAD_WIN32_DIR_DLL=/$(echo ${withval} | ${SED} -e 's/://')/dll/x64
+                PTHREAD_WIN32_DIR_DLL_WIN_FORM=$withval/dll/x64
+            else
+                PTHREAD_WIN32_DIR=$withval/lib/x86
+                PTHREAD_WIN32_DIR_DLL=/$(echo ${withval} | ${SED} -e 's/://')/dll/x86
+                PTHREAD_WIN32_DIR_DLL_WIN_FORM=$withval/dll/x86
+            fi
             PTHREAD_INCLUDES=-I$withval/include
             PTHREAD_LDFLAGS=-L$PTHREAD_WIN32_DIR
             PTHREAD_LIBS="-lpthreadVC2"
+            AC_SUBST([PTHREAD_WIN32_DIR_DLL_WIN_FORM])
             AC_SUBST([PTHREAD_WIN32_DIR_DLL])
             AC_SUBST([PTHREAD_INCLUDES])
             AC_SUBST([PTHREAD_LDFLAGS])
@@ -114,6 +146,7 @@ AC_DEFUN([OVS_CHECK_WIN32],
       )
 
       AC_DEFINE([WIN32], [1], [Define to 1 if building on WIN32.])
+      AC_CHECK_TYPES([struct timespec], [], [], [[#include <time.h>]])
       AH_BOTTOM([#ifdef WIN32
 #include "include/windows/windefs.h"
 #endif])
@@ -140,6 +173,32 @@ AC_ARG_WITH([vstudiotarget],
       )
 
   AC_SUBST([VSTUDIO_CONFIG])
+
+AC_ARG_WITH([vstudiotargetver],
+         [AS_HELP_STRING([--with-vstudiotargetver=target_ver1,target_ver2],
+            [Target versions: Win8,Win8.1,Win10])],
+         [
+            targetver=`echo "$withval" | tr -s , ' ' `
+            for ver in $targetver; do
+                case "$ver" in
+                "Win8") VSTUDIO_WIN8=true ;;
+                "Win8.1")  VSTUDIO_WIN8_1=true ;;
+                "Win10") VSTUDIO_WIN10=true ;;
+                *) AC_MSG_ERROR([No valid Visual Studio target version found]) ;;
+                esac
+            done
+
+         ], [
+            VSTUDIO_WIN8=true
+            VSTUDIO_WIN8_1=true
+            VSTUDIO_WIN10=true
+         ]
+      )
+
+  AM_CONDITIONAL([VSTUDIO_WIN8], [test -n "$VSTUDIO_WIN8"])
+  AM_CONDITIONAL([VSTUDIO_WIN8_1], [test -n "$VSTUDIO_WIN8_1"])
+  AM_CONDITIONAL([VSTUDIO_WIN10], [test -n "$VSTUDIO_WIN10"])
+
   AC_DEFINE([VSTUDIO_DDK], [1], [System uses the Visual Studio build target.])
   AM_CONDITIONAL([VSTUDIO_DDK], [test -n "$VSTUDIO_CONFIG"])
 ])
@@ -155,6 +214,42 @@ AC_DEFUN([OVS_CHECK_NETLINK],
    if test "$HAVE_NETLINK" = yes; then
       AC_DEFINE([HAVE_NETLINK], [1],
                 [Define to 1 if Netlink protocol is available.])
+   fi])
+
+dnl Checks for libcap-ng.
+AC_DEFUN([OVS_CHECK_LIBCAPNG],
+  [AC_ARG_ENABLE(
+     [libcapng],
+     [AC_HELP_STRING([--disable-libcapng], [Disable Linux capability support])],
+     [case "${enableval}" in
+        (yes) libcapng=true ;;
+        (no)  libcapng=false ;;
+        (*) AC_MSG_ERROR([bad value ${enableval} for --enable-libcapng]) ;;
+      esac],
+     [libcapng=check])
+
+   if test "$libcapng" != false; then
+       AC_CHECK_LIB([cap-ng], [capng_clear], [HAVE_LIBCAPNG=yes])
+
+       if test "$HAVE_LIBCAPNG" != yes; then
+           if test "$libcapng" = true ; then
+                AC_MSG_ERROR([libcap-ng support requested, but not found])
+           fi
+           if test "$libcapng" = check ; then
+                 AC_MSG_WARN([cannot find libcap-ng.
+--user option will not be supported on Linux.
+(you may use --disable-libcapng to suppress this warning). ])
+           fi
+       fi
+   fi
+
+   AC_SUBST([HAVE_LIBCAPNG])
+   AM_CONDITIONAL([HAVE_LIBCAPNG], [test "$HAVE_LIBCAPNG" = yes])
+   if test "$HAVE_LIBCAPNG" = yes; then
+      AC_DEFINE([HAVE_LIBCAPNG], [1],
+                [Define to 1 if libcap-ng is available.])
+      CAPNG_LDADD="-lcap-ng"
+      AC_SUBST([CAPNG_LDADD])
    fi])
 
 dnl Checks for OpenSSL.
@@ -261,7 +356,7 @@ AC_DEFUN([OVS_CHECK_PYTHON],
         ovs_cv_python=$PYTHON
       else
         ovs_cv_python=no
-        for binary in python python2.7; do
+        for binary in python2 python2.7 python; do
           ovs_save_IFS=$IFS; IFS=$PATH_SEPARATOR
           for dir in $PATH; do
             IFS=$ovs_save_IFS
@@ -277,15 +372,91 @@ else:
           done
         done
       fi])
-   AC_SUBST([HAVE_PYTHON])
-   AM_MISSING_PROG([PYTHON], [python])
-   if test $ovs_cv_python != no; then
-     PYTHON=$ovs_cv_python
-     HAVE_PYTHON=yes
-   else
-     HAVE_PYTHON=no
+
+   # Set $PYTHON from cache variable.
+   if test $ovs_cv_python = no; then
+     AC_MSG_ERROR([cannot find python 2.7 or higher.])
    fi
-   AM_CONDITIONAL([HAVE_PYTHON], [test "$HAVE_PYTHON" = yes])])
+   AM_MISSING_PROG([PYTHON], [python])
+   PYTHON=$ovs_cv_python
+
+   # HAVE_PYTHON is always true.  (Python has not always been a build
+   # requirement, so this variable is now obsolete.)
+   AC_SUBST([HAVE_PYTHON])
+   HAVE_PYTHON=yes
+   AM_CONDITIONAL([HAVE_PYTHON], [test "$HAVE_PYTHON" = yes])
+
+   AC_MSG_CHECKING([whether $PYTHON has six library])
+   if ! $PYTHON -c 'import six ; six.moves.range' >&AS_MESSAGE_LOG_FD 2>&1; then
+     AC_MSG_ERROR([Missing Python six library or version too old.])
+   fi
+   AC_MSG_RESULT([yes])])
+
+dnl Checks for Python 3.x, x >= 4.
+AC_DEFUN([OVS_CHECK_PYTHON3],
+  [AC_CACHE_CHECK(
+     [for Python 3.x for x >= 4],
+     [ovs_cv_python3],
+     [if test -n "$PYTHON3"; then
+        ovs_cv_python3=$PYTHON3
+      else
+        ovs_cv_python3=no
+        for binary in python3 python3.4; do
+          ovs_save_IFS=$IFS; IFS=$PATH_SEPARATOR
+          for dir in $PATH; do
+            IFS=$ovs_save_IFS
+            test -z "$dir" && dir=.
+            if test -x "$dir"/"$binary" && "$dir"/"$binary" -c 'import sys
+if sys.hexversion >= 0x03040000 and sys.hexversion < 0x04000000:
+    sys.exit(0)
+else:
+    sys.exit(1)'; then
+              ovs_cv_python3=$dir/$binary
+              break 2
+            fi
+          done
+        done
+        if test $ovs_cv_python3 != no; then
+          if test -x "$ovs_cv_python3" && ! "$ovs_cv_python3" -c 'import six' >/dev/null 2>&1; then
+            ovs_cv_python3=no
+            AC_MSG_WARN([Missing Python six library.])
+          fi
+        fi
+      fi])
+   AC_SUBST([HAVE_PYTHON3])
+   AM_MISSING_PROG([PYTHON3], [python3])
+   if test $ovs_cv_python3 != no; then
+     PYTHON3=$ovs_cv_python3
+     HAVE_PYTHON3=yes
+   else
+     HAVE_PYTHON3=no
+   fi
+   AM_CONDITIONAL([HAVE_PYTHON3], [test "$HAVE_PYTHON3" = yes])])
+
+
+dnl Checks for flake8.
+AC_DEFUN([OVS_CHECK_FLAKE8],
+  [AC_CACHE_CHECK(
+    [for flake8],
+    [ovs_cv_flake8],
+    [if flake8 --version >/dev/null 2>&1; then
+       ovs_cv_flake8=yes
+     else
+       ovs_cv_flake8=no
+     fi])
+   AM_CONDITIONAL([HAVE_FLAKE8], [test "$ovs_cv_flake8" = yes])])
+
+dnl Checks for sphinx.
+AC_DEFUN([OVS_CHECK_SPHINX],
+  [AC_CACHE_CHECK(
+    [for sphinx],
+    [ovs_cv_sphinx],
+    [if type sphinx-build >/dev/null 2>&1; then
+       ovs_cv_sphinx=yes
+     else
+       ovs_cv_sphinx=no
+     fi])
+   AM_CONDITIONAL([HAVE_SPHINX], [test "$ovs_cv_sphinx" = yes])])
 
 dnl Checks for dot.
 AC_DEFUN([OVS_CHECK_DOT],
@@ -428,7 +599,7 @@ TEST_ATOMIC_TYPE(unsigned long long int);
 dnl OVS_CHECK_ATOMIC_ALWAYS_LOCK_FREE(SIZE)
 dnl
 dnl Checks __atomic_always_lock_free(SIZE, 0)
-AC_DEFUN([OVS_CHECK_ATOMIC_ALWAYS_LOCK_FREE], 
+AC_DEFUN([OVS_CHECK_ATOMIC_ALWAYS_LOCK_FREE],
   [AC_CACHE_CHECK(
     [value of __atomic_always_lock_free($1)],
     [ovs_cv_atomic_always_lock_free_$1],
@@ -464,3 +635,37 @@ AC_DEFUN([OVS_CHECK_PRAGMA_MESSAGE],
      [AC_DEFINE(HAVE_PRAGMA_MESSAGE,1,[Define if compiler supports #pragma
      message directive])])
   ])
+
+dnl OVS_LIBTOOL_VERSIONS sets the major, minor, micro version information for
+dnl OVS_LTINFO variable.  This variable locks libtool information for shared
+dnl objects, allowing multiple versions with different ABIs to coexist.
+AC_DEFUN([OVS_LIBTOOL_VERSIONS],
+    [AC_MSG_CHECKING(linker output version information)
+  OVS_MAJOR=`echo "$PACKAGE_VERSION" | sed -e 's/[[.]].*//'`
+  OVS_MINOR=`echo "$PACKAGE_VERSION" | sed -e "s/^$OVS_MAJOR//" -e 's/^.//' -e 's/[[.]].*//'`
+  OVS_MICRO=`echo "$PACKAGE_VERSION" | sed -e "s/^$OVS_MAJOR.$OVS_MINOR//" -e 's/^.//' -e 's/[[^0-9]].*//'`
+  OVS_LT_RELINFO="-release $OVS_MAJOR.$OVS_MINOR"
+  OVS_LT_VERINFO="-version-info $LT_CURRENT:$OVS_MICRO"
+  OVS_LTINFO="$OVS_LT_RELINFO $OVS_LT_VERINFO"
+  AC_MSG_RESULT([libX-$OVS_MAJOR.$OVS_MINOR.so.$LT_CURRENT.0.$OVS_MICRO)])
+  AC_SUBST(OVS_LTINFO)
+    ])
+
+dnl OVS does not use C++ itself, but it provides public header files
+dnl that a C++ compiler should accept, so when --enable-Werror is in
+dnl effect and a C++ compiler is available, we enable building a C++
+dnl source file that #includes all the public headers, as a way to
+dnl ensure that they are acceptable as C++.
+AC_DEFUN([OVS_CHECK_CXX],
+  [AC_REQUIRE([AC_PROG_CXX])
+   AC_REQUIRE([OVS_ENABLE_WERROR])
+   AX_CXX_COMPILE_STDCXX([11], [], [optional])
+   if test $enable_Werror = yes && test $HAVE_CXX11 = 1; then
+     enable_cxx=:
+     AC_LANG_PUSH([C++])
+     AC_CHECK_HEADERS([atomic])
+     AC_LANG_POP([C++])
+   else
+     enable_cxx=false
+   fi
+   AM_CONDITIONAL([HAVE_CXX], [$enable_cxx])])

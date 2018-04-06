@@ -21,8 +21,8 @@
 
 #include <time.h>
 #include "dp-packet.h"
-#include "hmap.h"
-#include "list.h"
+#include "openvswitch/hmap.h"
+#include "openvswitch/list.h"
 #include "ovs-atomic.h"
 #include "ovs-thread.h"
 #include "packets.h"
@@ -214,5 +214,6 @@ bool mcast_snooping_is_membership(ovs_be16 igmp_type);
 /* Flush. */
 void mcast_snooping_mdb_flush(struct mcast_snooping *ms);
 void mcast_snooping_flush(struct mcast_snooping *ms);
+void mcast_snooping_flush_bundle(struct mcast_snooping *ms, void *port);
 
 #endif /* mcast-snooping.h */

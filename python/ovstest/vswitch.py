@@ -15,9 +15,6 @@
 """
 vswitch module allows its callers to interact with OVS DB.
 """
-import exceptions
-import subprocess
-
 import util
 
 
@@ -36,6 +33,7 @@ def ovs_vsctl_del_bridge(bridge):
     ret, _out, _err = util.start_process(["ovs-vsctl", "del-br", bridge])
     return ret
 
+
 def ovs_vsctl_del_pbridge(bridge, iface):
     """
     This function deletes the OVS bridge and assigns the bridge IP address
@@ -43,6 +41,7 @@ def ovs_vsctl_del_pbridge(bridge, iface):
     """
     (ip_addr, mask) = util.interface_get_ip(bridge)
     util.interface_assign_ip(iface, ip_addr, mask)
+    util.interface_up(iface)
     util.move_routes(bridge, iface)
     return ovs_vsctl_del_bridge(bridge)
 

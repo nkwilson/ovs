@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 VMware, Inc.
+ * Copyright (c) 2014, 2016 VMware, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,39 +22,52 @@
 
 #include "precomp.h"
 
-#include "Switch.h"
-#include "Vport.h"
-#include "Event.h"
-#include "User.h"
+#include "Actions.h"
 #include "Datapath.h"
-#include "PacketIO.h"
-#include "Checksum.h"
-#include "NetProto.h"
+#include "Debug.h"
+#include "Event.h"
 #include "Flow.h"
-#include "TunnelIntf.h"
 #include "Jhash.h"
+#include "NetProto.h"
+#include "Offload.h"
+#include "PacketIO.h"
+#include "Switch.h"
+#include "TunnelIntf.h"
+#include "User.h"
+#include "Vport.h"
 
 #ifdef OVS_DBG_MOD
 #undef OVS_DBG_MOD
 #endif
 #define OVS_DBG_MOD OVS_DBG_USER
-#include "Debug.h"
 
 POVS_PACKET_QUEUE_ELEM OvsGetNextPacket(POVS_OPEN_INSTANCE instance);
 extern PNDIS_SPIN_LOCK gOvsCtrlLock;
 extern POVS_SWITCH_CONTEXT gOvsSwitchContext;
 OVS_USER_STATS ovsUserStats;
 
-static VOID _MapNlAttrToOvsPktExec(PNL_ATTR *nlAttrs, PNL_ATTR *keyAttrs,
-                                   OvsPacketExecute  *execute);
+static VOID _MapNlAttrToOvsPktExec(PNL_MSG_HDR nlMsgHdr, PNL_ATTR *nlAttrs,
+                                   PNL_ATTR *keyAttrs,
+                                   OvsPacketExecute *execute);
 extern NL_POLICY nlFlowKeyPolicy[];
+extern UINT32 nlFlowKeyPolicyLen;
+extern NL_POLICY nlFlowTunnelKeyPolicy[];
+extern UINT32 nlFlowTunnelKeyPolicyLen;
+DRIVER_CANCEL OvsCancelIrpDatapath;
 
+_IRQL_raises_(DISPATCH_LEVEL)
+_IRQL_saves_global_(OldIrql, gOvsSwitchContext->pidHashLock)
+_Acquires_lock_(gOvsSwitchContext->pidHashLock)
 static __inline VOID
 OvsAcquirePidHashLock()
 {
     NdisAcquireSpinLock(&(gOvsSwitchContext->pidHashLock));
 }
 
+_IRQL_requires_(DISPATCH_LEVEL)
+_IRQL_restores_global_(OldIrql, gOvsSwitchContext->pidHashLock)
+_Requires_lock_held_(gOvsSwitchContext->pidHashLock)
+_Releases_lock_(gOvsSwitchContext->pidHashLock)
 static __inline VOID
 OvsReleasePidHashLock()
 {
@@ -246,60 +259,6 @@ OvsReadDpIoctl(PFILE_OBJECT fileObject,
     return STATUS_SUCCESS;
 }
 
-/* Helper function to allocate a Forwarding Context for an NBL */
-NTSTATUS
-OvsAllocateForwardingContextForNBL(POVS_SWITCH_CONTEXT switchContext,
-                                   PNET_BUFFER_LIST nbl)
-{
-    return switchContext->NdisSwitchHandlers.
-        AllocateNetBufferListForwardingContext(
-            switchContext->NdisSwitchContext, nbl);
-}
-
-/*
- * --------------------------------------------------------------------------
- * This function allocates all the stuff necessary for creating an NBL from the
- * input buffer of specified length, namely, a nonpaged data buffer of size
- * length, an MDL from it, and a NB and NBL from it. It does not allocate an NBL
- * context yet. It also copies data from the specified buffer to the NBL.
- * --------------------------------------------------------------------------
- */
-PNET_BUFFER_LIST
-OvsAllocateNBLForUserBuffer(POVS_SWITCH_CONTEXT switchContext,
-                            PVOID userBuffer,
-                            ULONG length)
-{
-    UINT8 *data = NULL;
-    PNET_BUFFER_LIST nbl = NULL;
-    PNET_BUFFER nb;
-    PMDL mdl;
-
-    if (length > OVS_DEFAULT_DATA_SIZE) {
-        nbl = OvsAllocateVariableSizeNBL(switchContext, length,
-                                         OVS_DEFAULT_HEADROOM_SIZE);
-
-    } else {
-        nbl = OvsAllocateFixSizeNBL(switchContext, length,
-                                    OVS_DEFAULT_HEADROOM_SIZE);
-    }
-    if (nbl == NULL) {
-        return NULL;
-    }
-
-    nb = NET_BUFFER_LIST_FIRST_NB(nbl);
-    mdl = NET_BUFFER_CURRENT_MDL(nb);
-    data = (PUINT8)MmGetSystemAddressForMdlSafe(mdl, LowPagePriority) +
-                    NET_BUFFER_CURRENT_MDL_OFFSET(nb);
-    if (!data) {
-        OvsCompleteNBL(switchContext, nbl, TRUE);
-        return NULL;
-    }
-
-    NdisMoveMemory(data, userBuffer, length);
-
-    return nbl;
-}
-
 /*
  *----------------------------------------------------------------------------
  *  OvsNlExecuteCmdHandler --
@@ -332,14 +291,16 @@ OvsNlExecuteCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
         [OVS_PACKET_ATTR_ACTIONS] = {.type = NL_A_UNSPEC, .optional = FALSE},
         [OVS_PACKET_ATTR_USERDATA] = {.type = NL_A_UNSPEC, .optional = TRUE},
         [OVS_PACKET_ATTR_EGRESS_TUN_KEY] = {.type = NL_A_UNSPEC,
-                                            .optional = TRUE}
+                                            .optional = TRUE},
+        [OVS_PACKET_ATTR_MRU] = { .type = NL_A_U16, .optional = TRUE }
     };
 
     RtlZeroMemory(&execute, sizeof(OvsPacketExecute));
 
     /* Get all the top level Flow attributes */
     if ((NlAttrParse(nlMsgHdr, attrOffset, NlMsgAttrsLen(nlMsgHdr),
-                     nlPktExecPolicy, nlAttrs, ARRAY_SIZE(nlAttrs)))
+                     nlPktExecPolicy, ARRAY_SIZE(nlPktExecPolicy),
+                     nlAttrs, ARRAY_SIZE(nlAttrs)))
                      != TRUE) {
         OVS_LOG_ERROR("Attr Parsing failed for msg: %p",
                        nlMsgHdr);
@@ -353,8 +314,8 @@ OvsNlExecuteCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
     /* Get flow keys attributes */
     if ((NlAttrParseNested(nlMsgHdr, keyAttrOffset,
                            NlAttrLen(nlAttrs[OVS_PACKET_ATTR_KEY]),
-                           nlFlowKeyPolicy, keyAttrs,
-                           ARRAY_SIZE(keyAttrs))) != TRUE) {
+                           nlFlowKeyPolicy, nlFlowKeyPolicyLen,
+                           keyAttrs, ARRAY_SIZE(keyAttrs))) != TRUE) {
         OVS_LOG_ERROR("Key Attr Parsing failed for msg: %p", nlMsgHdr);
         status = STATUS_UNSUCCESSFUL;
         goto done;
@@ -362,7 +323,7 @@ OvsNlExecuteCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
 
     execute.dpNo = ovsHdr->dp_ifindex;
 
-    _MapNlAttrToOvsPktExec(nlAttrs, keyAttrs, &execute);
+    _MapNlAttrToOvsPktExec(nlMsgHdr, nlAttrs, keyAttrs, &execute);
 
     status = OvsExecuteDpIoctl(&execute);
 
@@ -396,8 +357,9 @@ OvsNlExecuteCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
 
             POVS_MESSAGE_ERROR msgError = (POVS_MESSAGE_ERROR)
                                            usrParamsCtx->outputBuffer;
-            NlBuildErrorMsg(msgIn, msgError, nlError);
-            *replyLen = msgError->nlMsg.nlmsgLen;
+
+            ASSERT(msgError);
+            NlBuildErrorMsg(msgIn, msgError, nlError, replyLen);
             status = STATUS_SUCCESS;
             goto done;
         }
@@ -414,30 +376,41 @@ done:
  *----------------------------------------------------------------------------
  */
 static VOID
-_MapNlAttrToOvsPktExec(PNL_ATTR *nlAttrs, PNL_ATTR *keyAttrs,
-                       OvsPacketExecute *execute)
+_MapNlAttrToOvsPktExec(PNL_MSG_HDR nlMsgHdr, PNL_ATTR *nlAttrs,
+                       PNL_ATTR *keyAttrs, OvsPacketExecute *execute)
 {
     execute->packetBuf = NlAttrGet(nlAttrs[OVS_PACKET_ATTR_PACKET]);
     execute->packetLen = NlAttrGetSize(nlAttrs[OVS_PACKET_ATTR_PACKET]);
 
+    execute->nlMsgHdr = nlMsgHdr;
+
     execute->actions = NlAttrGet(nlAttrs[OVS_PACKET_ATTR_ACTIONS]);
     execute->actionsLen = NlAttrGetSize(nlAttrs[OVS_PACKET_ATTR_ACTIONS]);
 
+    ASSERT(keyAttrs[OVS_KEY_ATTR_IN_PORT]);
     execute->inPort = NlAttrGetU32(keyAttrs[OVS_KEY_ATTR_IN_PORT]);
+    execute->keyAttrs = keyAttrs;
+
+    if (nlAttrs[OVS_PACKET_ATTR_MRU]) {
+        execute->mru = NlAttrGetU16(nlAttrs[OVS_PACKET_ATTR_MRU]);
+    }
 }
 
 NTSTATUS
 OvsExecuteDpIoctl(OvsPacketExecute *execute)
 {
     NTSTATUS                    status = STATUS_SUCCESS;
-    NTSTATUS                    ndisStatus;
+    NTSTATUS                    ndisStatus = STATUS_SUCCESS;
     LOCK_STATE_EX               lockState;
-    PNET_BUFFER_LIST pNbl;
-    PNL_ATTR actions;
+    PNET_BUFFER_LIST            pNbl = NULL;
+    PNL_ATTR                    actions = NULL;
     PNDIS_SWITCH_FORWARDING_DETAIL_NET_BUFFER_LIST_INFO fwdDetail;
-    OvsFlowKey key;
-    OVS_PACKET_HDR_INFO layers;
-    POVS_VPORT_ENTRY vport;
+    OvsFlowKey                  key = { 0 };
+    OVS_PACKET_HDR_INFO         layers = { 0 };
+    POVS_VPORT_ENTRY            vport = NULL;
+    PNL_ATTR tunnelAttrs[__OVS_TUNNEL_KEY_ATTR_MAX];
+    OvsFlowKey tempTunKey = {0};
+    POVS_BUFFER_CONTEXT ctx;
 
     if (execute->packetLen == 0) {
         status = STATUS_INVALID_PARAMETER;
@@ -452,8 +425,8 @@ OvsExecuteDpIoctl(OvsPacketExecute *execute)
      * Allocate the NBL, copy the data from the userspace buffer. Allocate
      * also, the forwarding context for the packet.
      */
-    pNbl = OvsAllocateNBLForUserBuffer(gOvsSwitchContext, execute->packetBuf,
-                                       execute->packetLen);
+    pNbl = OvsAllocateNBLFromBuffer(gOvsSwitchContext, execute->packetBuf,
+                                    execute->packetLen);
     if (pNbl == NULL) {
         status = STATUS_NO_MEMORY;
         goto exit;
@@ -470,13 +443,49 @@ OvsExecuteDpIoctl(OvsPacketExecute *execute)
     }
     // XXX: Figure out if any of the other members of fwdDetail need to be set.
 
-    ndisStatus = OvsExtractFlow(pNbl, fwdDetail->SourcePortId, &key, &layers,
-                                NULL);
+    status = OvsGetFlowMetadata(&key, execute->keyAttrs);
+    if (status != STATUS_SUCCESS) {
+        goto dropit;
+    }
+
+    if (execute->keyAttrs[OVS_KEY_ATTR_TUNNEL]) {
+        UINT32 tunnelKeyAttrOffset;
+
+        tunnelKeyAttrOffset = (UINT32)((PCHAR)
+                              (execute->keyAttrs[OVS_KEY_ATTR_TUNNEL])
+                              - (PCHAR)execute->nlMsgHdr);
+
+        /* Get tunnel keys attributes */
+        if ((NlAttrParseNested(execute->nlMsgHdr, tunnelKeyAttrOffset,
+                               NlAttrLen(execute->keyAttrs[OVS_KEY_ATTR_TUNNEL]),
+                               nlFlowTunnelKeyPolicy, nlFlowTunnelKeyPolicyLen,
+                               tunnelAttrs, ARRAY_SIZE(tunnelAttrs)))
+                               != TRUE) {
+            OVS_LOG_ERROR("Tunnel key Attr Parsing failed for msg: %p",
+                           execute->nlMsgHdr);
+            status = STATUS_INVALID_PARAMETER;
+            goto dropit;
+        }
+
+        MapTunAttrToFlowPut(execute->keyAttrs, tunnelAttrs, &tempTunKey);
+    }
+
+    ndisStatus = OvsExtractFlow(pNbl, execute->inPort, &key, &layers,
+                     tempTunKey.tunKey.dst == 0 ? NULL : &tempTunKey.tunKey);
+
+    if (ndisStatus != NDIS_STATUS_SUCCESS) {
+        /* Invalid network header */
+        goto dropit;
+    }
+
+    ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(pNbl);
+    ctx->mru = execute->mru;
+
     if (ndisStatus == NDIS_STATUS_SUCCESS) {
         NdisAcquireRWLockRead(gOvsSwitchContext->dispatchLock, &lockState, 0);
         ndisStatus = OvsActionsExecute(gOvsSwitchContext, NULL, pNbl,
                                        vport ? vport->portNo :
-                                               OVS_DEFAULT_PORT_NO,
+                                               OVS_DPPORT_NUMBER_INVALID,
                                        NDIS_SEND_FLAGS_SWITCH_DESTINATION_GROUP,
                                        &key, NULL, &layers, actions,
                                        execute->actionsLen);
@@ -491,6 +500,7 @@ OvsExecuteDpIoctl(OvsPacketExecute *execute)
         }
     }
 
+dropit:
     if (pNbl) {
         OvsCompleteNBL(gOvsSwitchContext, pNbl, TRUE);
     }
@@ -696,7 +706,6 @@ OvsQueuePackets(PLIST_ENTRY packetList,
 {
     POVS_USER_PACKET_QUEUE upcallQueue = NULL;
     POVS_PACKET_QUEUE_ELEM elem;
-    PIRP irp = NULL;
     PLIST_ENTRY  link;
     UINT32 num = 0;
     LIST_ENTRY dropPackets;
@@ -726,23 +735,17 @@ OvsQueuePackets(PLIST_ENTRY packetList,
                 InsertTailList(&upcallQueue->packetList, &elem->link);
                 upcallQueue->numPackets++;
                 if (upcallQueue->pendingIrp) {
+                    PIRP irp = upcallQueue->pendingIrp;
                     PDRIVER_CANCEL cancelRoutine;
-                    irp = upcallQueue->pendingIrp;
                     upcallQueue->pendingIrp = NULL;
                     cancelRoutine = IoSetCancelRoutine(irp, NULL);
-                    if (cancelRoutine == NULL) {
-                        irp = NULL;
+                    if (cancelRoutine != NULL) {
+                        OvsCompleteIrpRequest(irp, 0, STATUS_SUCCESS);
                     }
                 }
             }
-
-            if (irp) {
-                OvsCompleteIrpRequest(irp, 0, STATUS_SUCCESS);
-            }
-
             NdisReleaseSpinLock(&upcallQueue->queueLock);
         }
-
         OvsReleasePidHashLock();
     }
 
@@ -770,7 +773,7 @@ NTSTATUS
 OvsCreateAndAddPackets(PVOID userData,
                        UINT32 userDataLen,
                        UINT32 cmd,
-                       UINT32 inPort,
+                       POVS_VPORT_ENTRY vport,
                        OvsFlowKey *key,
                        PNET_BUFFER_LIST nbl,
                        BOOLEAN isRecv,
@@ -787,7 +790,8 @@ OvsCreateAndAddPackets(PVOID userData,
         NDIS_TCP_LARGE_SEND_OFFLOAD_NET_BUFFER_LIST_INFO tsoInfo;
         UINT32 packetLength;
 
-        tsoInfo.Value = NET_BUFFER_LIST_INFO(nbl, TcpLargeSendNetBufferListInfo);
+        tsoInfo.Value = NET_BUFFER_LIST_INFO(nbl,
+                                             TcpLargeSendNetBufferListInfo);
         nb = NET_BUFFER_LIST_FIRST_NB(nbl);
         packetLength = NET_BUFFER_DATA_LENGTH(nb);
 
@@ -796,7 +800,7 @@ OvsCreateAndAddPackets(PVOID userData,
         if (tsoInfo.LsoV1Transmit.MSS) {
             OVS_LOG_TRACE("l4Offset %d", hdrInfo->l4Offset);
             newNbl = OvsTcpSegmentNBL(switchContext, nbl, hdrInfo,
-                    tsoInfo.LsoV1Transmit.MSS , 0);
+                                      tsoInfo.LsoV1Transmit.MSS , 0, FALSE);
             if (newNbl == NULL) {
                 return NDIS_STATUS_FAILURE;
             }
@@ -807,7 +811,7 @@ OvsCreateAndAddPackets(PVOID userData,
     nb = NET_BUFFER_LIST_FIRST_NB(nbl);
     while (nb) {
         elem = OvsCreateQueueNlPacket(userData, userDataLen,
-                                    cmd, inPort, key, nbl, nb,
+                                    cmd, vport, key, nbl, nb,
                                     isRecv, hdrInfo);
         if (elem) {
             InsertTailList(list, &elem->link);
@@ -836,7 +840,7 @@ OvsGetUpcallMsgSize(PVOID userData,
         size += NlAttrTotalSize(userDataLen);
     }
     /* OVS_PACKET_ATTR_EGRESS_TUN_KEY */
-    /* Is it included in the the flwo key attr XXX */
+    /* Is it included in the flow key attr XXX */
     if (tunnelKey) {
         size += NlAttrTotalSize(OvsTunKeyAttrSize());
     }
@@ -889,7 +893,8 @@ OvsCompletePacketHeader(UINT8 *packet,
                                          (UINT32 *)&ipHdr->DestinationAddress,
                                          IPPROTO_TCP, hdrInfoOut->l4PayLoad);
         } else {
-            PIPV6_HEADER ipv6Hdr = (PIPV6_HEADER)(packet + hdrInfoIn->l3Offset);
+            PIPV6_HEADER ipv6Hdr = (PIPV6_HEADER)(packet +
+                                                  hdrInfoIn->l3Offset);
             hdrInfoOut->l4PayLoad =
                 (UINT16)(ntohs(ipv6Hdr->PayloadLength) +
                 hdrInfoIn->l3Offset + sizeof(IPV6_HEADER)-
@@ -903,9 +908,9 @@ OvsCompletePacketHeader(UINT8 *packet,
         hdrInfoOut->tcpCsumNeeded = 1;
         ovsUserStats.recalTcpCsum++;
     } else if (!isRecv) {
-        if (csumInfo.Transmit.TcpChecksum) {
+        if (hdrInfoIn->isTcp && csumInfo.Transmit.TcpChecksum) {
             hdrInfoOut->tcpCsumNeeded = 1;
-        } else if (csumInfo.Transmit.UdpChecksum) {
+        } else if (hdrInfoIn->isUdp && csumInfo.Transmit.UdpChecksum) {
             hdrInfoOut->udpCsumNeeded = 1;
         }
         if (hdrInfoOut->tcpCsumNeeded || hdrInfoOut->udpCsumNeeded) {
@@ -915,7 +920,8 @@ OvsCompletePacketHeader(UINT8 *packet,
                 hdrInfoOut->tcpCsumNeeded ? IPPROTO_TCP : IPPROTO_UDP;
 #endif
             if (hdrInfoIn->isIPv4) {
-                PIPV4_HEADER ipHdr = (PIPV4_HEADER)(packet + hdrInfoIn->l3Offset);
+                PIPV4_HEADER ipHdr = (PIPV4_HEADER)(packet +
+                                                    hdrInfoIn->l3Offset);
                 hdrInfoOut->l4PayLoad = (UINT16)(ntohs(ipHdr->TotalLength) -
                     (ipHdr->HeaderLength << 2));
 #ifdef DBG
@@ -986,7 +992,7 @@ POVS_PACKET_QUEUE_ELEM
 OvsCreateQueueNlPacket(PVOID userData,
                        UINT32 userDataLen,
                        UINT32 cmd,
-                       UINT32 inPort,
+                       POVS_VPORT_ENTRY vport,
                        OvsFlowKey *key,
                        PNET_BUFFER_LIST nbl,
                        PNET_BUFFER nb,
@@ -1004,10 +1010,7 @@ OvsCreateQueueNlPacket(PVOID userData,
     UINT32 nlMsgSize;
     NL_BUFFER nlBuf;
     PNL_MSG_HDR nlMsg;
-
-    /* XXX pass vport in the stack rather than portNo */
-    POVS_VPORT_ENTRY vport =
-        OvsFindVportByPortNo(gOvsSwitchContext, inPort);
+    POVS_BUFFER_CONTEXT ctx;
 
     if (vport == NULL){
         /* No vport is not fatal. */
@@ -1027,8 +1030,8 @@ OvsCreateQueueNlPacket(PVOID userData,
     csumInfo.Value = NET_BUFFER_LIST_INFO(nbl, TcpIpChecksumNetBufferListInfo);
 
     if (isRecv && (csumInfo.Receive.TcpChecksumFailed ||
-                  (csumInfo.Receive.UdpChecksumFailed && !hdrInfo->udpCsumZero) ||
-                  csumInfo.Receive.IpChecksumFailed)) {
+            (csumInfo.Receive.UdpChecksumFailed && !hdrInfo->udpCsumZero) ||
+            csumInfo.Receive.IpChecksumFailed)) {
         OVS_LOG_INFO("Packet dropped due to checksum failure.");
         ovsUserStats.dropDuetoChecksum++;
         return NULL;
@@ -1060,7 +1063,7 @@ OvsCreateQueueNlPacket(PVOID userData,
     elem->packet.queue = 0;
     /* XXX  no need as the length is already in the NL attrib */
     elem->packet.userDataLen = userDataLen;
-    elem->packet.inPort = inPort;
+    elem->packet.inPort = vport->portNo;
     elem->packet.cmd = cmd;
     if (cmd == (UINT32)OVS_PACKET_CMD_MISS) {
         ovsUserStats.miss++;
@@ -1089,6 +1092,14 @@ OvsCreateQueueNlPacket(PVOID userData,
     if (MapFlowKeyToNlKey(&nlBuf, key, OVS_PACKET_ATTR_KEY,
                           OVS_KEY_ATTR_TUNNEL) != STATUS_SUCCESS) {
         goto fail;
+    }
+
+    /* Set MRU attribute */
+    ctx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
+    if (ctx->mru != 0) {
+        if (!NlMsgPutTailU16(&nlBuf, OVS_PACKET_ATTR_MRU, (UINT16)ctx->mru)) {
+            goto fail;
+        }
     }
 
     /* XXX must send OVS_PACKET_ATTR_EGRESS_TUN_KEY if set by vswtchd */
@@ -1153,4 +1164,112 @@ OvsCreateQueueNlPacket(PVOID userData,
 fail:
     OvsFreeMemoryWithTag(elem, OVS_USER_POOL_TAG);
     return NULL;
+}
+
+/*
+ * --------------------------------------------------------------------------
+ *  Handler for the subscription for a packet queue
+ * --------------------------------------------------------------------------
+ */
+NTSTATUS
+OvsSubscribePacketCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+                             UINT32 *replyLen)
+{
+    NDIS_STATUS status;
+    BOOLEAN rc;
+    UINT8 join;
+    UINT32 pid;
+    const NL_POLICY policy[] =  {
+        [OVS_NL_ATTR_PACKET_PID] = {.type = NL_A_U32 },
+        [OVS_NL_ATTR_PACKET_SUBSCRIBE] = {.type = NL_A_U8 }
+        };
+    PNL_ATTR attrs[ARRAY_SIZE(policy)];
+
+    UNREFERENCED_PARAMETER(replyLen);
+
+    POVS_OPEN_INSTANCE instance =
+        (POVS_OPEN_INSTANCE)usrParamsCtx->ovsInstance;
+    POVS_MESSAGE msgIn = (POVS_MESSAGE)usrParamsCtx->inputBuffer;
+
+    rc = NlAttrParse(&msgIn->nlMsg, sizeof (*msgIn),
+         NlMsgAttrsLen((PNL_MSG_HDR)msgIn), policy, ARRAY_SIZE(policy),
+                       attrs, ARRAY_SIZE(attrs));
+    if (!rc) {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+
+    join = NlAttrGetU8(attrs[OVS_NL_ATTR_PACKET_SUBSCRIBE]);
+    pid = NlAttrGetU32(attrs[OVS_NL_ATTR_PACKET_PID]);
+
+    /* The socket subscribed with must be the same socket we perform receive*/
+    ASSERT(pid == instance->pid);
+
+    status = OvsSubscribeDpIoctl(instance, pid, join);
+
+    /*
+     * XXX Need to add this instance to a global data structure
+     * which hold all packet based instances. The data structure (hash)
+     * should be searched through the pid field of the instance for
+     * placing the missed packet into the correct queue
+     */
+done:
+    return status;
+}
+
+/*
+ * --------------------------------------------------------------------------
+ * Handler for queueing an IRP used for missed packet notification. The IRP is
+ * completed when a packet received and mismatched. STATUS_PENDING is returned
+ * on success. User mode keep a pending IRP at all times.
+ * --------------------------------------------------------------------------
+ */
+NTSTATUS
+OvsPendPacketCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+                       UINT32 *replyLen)
+{
+    UNREFERENCED_PARAMETER(replyLen);
+
+    POVS_OPEN_INSTANCE instance =
+        (POVS_OPEN_INSTANCE)usrParamsCtx->ovsInstance;
+
+    /*
+     * XXX access to packet queue must be through acquiring a lock as user mode
+     * could unsubscribe and the instnace will be freed.
+     */
+    return OvsWaitDpIoctl(usrParamsCtx->irp, instance->fileObject);
+}
+
+/*
+ * --------------------------------------------------------------------------
+ * Handler for reading missed pacckets from the driver event queue. This
+ * handler is executed when user modes issues a socket receive on a socket
+ * --------------------------------------------------------------------------
+ */
+NTSTATUS
+OvsReadPacketCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
+                       UINT32 *replyLen)
+{
+#ifdef DBG
+    POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
+#endif
+    POVS_OPEN_INSTANCE instance =
+        (POVS_OPEN_INSTANCE)usrParamsCtx->ovsInstance;
+    NTSTATUS status;
+
+    ASSERT(usrParamsCtx->devOp == OVS_READ_DEV_OP);
+
+    /* Should never read events with a dump socket */
+    ASSERT(instance->dumpState.ovsMsg == NULL);
+
+    /* Must have an packet queue */
+    ASSERT(instance->packetQueue != NULL);
+
+    /* Output buffer has been validated while validating read dev op. */
+    ASSERT(msgOut != NULL && usrParamsCtx->outputLength >= sizeof *msgOut);
+
+    /* Read a packet from the instance queue */
+    status = OvsReadDpIoctl(instance->fileObject, usrParamsCtx->outputBuffer,
+                            usrParamsCtx->outputLength, replyLen);
+    return status;
 }

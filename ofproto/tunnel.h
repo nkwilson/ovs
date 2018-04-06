@@ -28,18 +28,20 @@
 struct ovs_action_push_tnl;
 struct ofport_dpif;
 struct netdev;
+struct netdev_tnl_build_header_params;
 
 void ofproto_tunnel_init(void);
 bool tnl_port_reconfigure(const struct ofport_dpif *, const struct netdev *,
-                          odp_port_t, bool native_tnl, const char name[]);
+                          odp_port_t new_odp_port, odp_port_t old_odp_port,
+                          bool native_tnl, const char name[]);
 
 int tnl_port_add(const struct ofport_dpif *, const struct netdev *,
-                 odp_port_t odp_port, bool native_tnl, const char name[]);
-void tnl_port_del(const struct ofport_dpif *);
+                 odp_port_t, bool native_tnl, const char name[]);
+void tnl_port_del(const struct ofport_dpif *, odp_port_t);
 
 const struct ofport_dpif *tnl_port_receive(const struct flow *);
-bool tnl_xlate_init(const struct flow *base_flow, struct flow *flow,
-                    struct flow_wildcards *);
+void tnl_wc_init(struct flow *, struct flow_wildcards *);
+bool tnl_process_ecn(struct flow *);
 odp_port_t tnl_port_send(const struct ofport_dpif *, struct flow *,
                          struct flow_wildcards *wc);
 
@@ -47,13 +49,12 @@ odp_port_t tnl_port_send(const struct ofport_dpif *, struct flow *,
 static inline bool
 tnl_port_should_receive(const struct flow *flow)
 {
-    return flow->tunnel.ip_dst != 0;
+    return flow_tnl_dst_is_set(&flow->tunnel);
 }
 
-int tnl_port_build_header(const struct ofport_dpif *ofport,
-                          const struct flow *tnl_flow,
-                          uint8_t dmac[ETH_ADDR_LEN],
-                          uint8_t smac[ETH_ADDR_LEN],
-                          ovs_be32 ip_src, struct ovs_action_push_tnl *data);
+int
+tnl_port_build_header(const struct ofport_dpif *ofport,
+                      struct ovs_action_push_tnl *data,
+                      const struct netdev_tnl_build_header_params *params);
 
 #endif /* tunnel.h */

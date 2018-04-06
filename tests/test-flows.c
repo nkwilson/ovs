@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,16 +22,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include "classifier.h"
-#include "ofpbuf.h"
-#include "ofp-print.h"
-#include "ofp-util.h"
 #include "openflow/openflow.h"
+#include "openvswitch/ofp-match.h"
+#include "openvswitch/ofp-print.h"
+#include "openvswitch/ofpbuf.h"
+#include "openvswitch/vlog.h"
 #include "ovstest.h"
 #include "dp-packet.h"
 #include "pcap-file.h"
 #include "timeval.h"
 #include "util.h"
-#include "openvswitch/vlog.h"
 
 static void
 test_flows_main(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
@@ -78,14 +78,14 @@ test_flows_main(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         ofputil_match_to_ofp10_match(&match, &extracted_match);
 
         if (memcmp(&expected_match, &extracted_match, sizeof expected_match)) {
-            char *exp_s = ofp10_match_to_string(&expected_match, 2);
-            char *got_s = ofp10_match_to_string(&extracted_match, 2);
+            char *exp_s = ofp10_match_to_string(&expected_match, NULL, 2);
+            char *got_s = ofp10_match_to_string(&extracted_match, NULL, 2);
             errors++;
             printf("mismatch on packet #%d (1-based).\n", n);
             printf("Packet:\n");
-            ofp_print_packet(stdout, dp_packet_data(packet), dp_packet_size(packet));
+            ofp_print_packet(stdout, dp_packet_data(packet), dp_packet_size(packet), htonl(PT_ETH));
             ovs_hex_dump(stdout, dp_packet_data(packet), dp_packet_size(packet), 0, true);
-            match_print(&match);
+            match_print(&match, NULL);
             printf("Expected flow:\n%s\n", exp_s);
             printf("Actually extracted flow:\n%s\n", got_s);
             ovs_hex_dump(stdout, &expected_match, sizeof expected_match, 0, false);

@@ -19,10 +19,17 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "list.h"
+
+#ifdef DPDK_NETDEV
+#include <rte_config.h>
+#include <rte_mbuf.h>
+#endif
+
+#include "netdev-dpdk.h"
+#include "openvswitch/list.h"
 #include "packets.h"
 #include "util.h"
-#include "netdev-dpdk.h"
+#include "flow.h"
 
 #ifdef  __cplusplus
 extern "C" {
@@ -33,11 +40,15 @@ enum OVS_PACKED_ENUM dp_packet_source {
     DPBUF_STACK,               /* Un-movable stack space or static buffer. */
     DPBUF_STUB,                /* Starts on stack, may expand into heap. */
     DPBUF_DPDK,                /* buffer data is from DPDK allocated memory.
-                                * ref to build_dp_packet() in netdev-dpdk. */
+                                * ref to dp_packet_init_dpdk() in dp-packet.c.
+                                */
 };
+
+#define DP_PACKET_CONTEXT_SIZE 64
 
 /* Buffer for holding packet data.  A dp_packet is automatically reallocated
  * as necessary if it grows too large for the available memory.
+ * By default the packet type is set to Ethernet (PT_ETH).
  */
 struct dp_packet {
 #ifdef DPDK_NETDEV
@@ -48,8 +59,12 @@ struct dp_packet {
     uint16_t data_ofs;          /* First byte actually in use. */
     uint32_t size_;             /* Number of bytes in use. */
     uint32_t rss_hash;          /* Packet hash. */
+    bool rss_hash_valid;        /* Is the 'rss_hash' valid? */
 #endif
     enum dp_packet_source source;  /* Source of memory allocated as 'base'. */
+
+    /* All the following elements of this struct are copied in a single call
+     * of memcpy in dp_packet_clone_with_headroom. */
     uint8_t l2_pad_size;           /* Detected l2 padding size.
                                     * Padding is non-pullable. */
     uint16_t l2_5_ofs;             /* MPLS label stack offset, or UINT16_MAX */
@@ -57,7 +72,12 @@ struct dp_packet {
                                     * or UINT16_MAX. */
     uint16_t l4_ofs;               /* Transport-level header offset,
                                       or UINT16_MAX. */
-    struct pkt_metadata md;
+    uint32_t cutlen;               /* length in bytes to cut from the end. */
+    ovs_be32 packet_type;          /* Packet type as defined in OpenFlow */
+    union {
+        struct pkt_metadata md;
+        uint64_t data[DP_PACKET_CONTEXT_SIZE / 8];
+    };
 };
 
 static inline void *dp_packet_data(const struct dp_packet *);
@@ -73,7 +93,7 @@ static inline void dp_packet_set_allocated(struct dp_packet *, uint16_t);
 
 void *dp_packet_resize_l2(struct dp_packet *, int increment);
 void *dp_packet_resize_l2_5(struct dp_packet *, int increment);
-static inline void *dp_packet_l2(const struct dp_packet *);
+static inline void *dp_packet_eth(const struct dp_packet *);
 static inline void dp_packet_reset_offsets(struct dp_packet *);
 static inline uint8_t dp_packet_l2_pad_size(const struct dp_packet *);
 static inline void dp_packet_set_l2_pad_size(struct dp_packet *, uint8_t);
@@ -139,7 +159,6 @@ static inline void *dp_packet_try_pull(struct dp_packet *, size_t);
 
 void *dp_packet_steal_data(struct dp_packet *);
 
-char *dp_packet_to_string(const struct dp_packet *, size_t maxbytes);
 static inline bool dp_packet_equal(const struct dp_packet *,
                                    const struct dp_packet *);
 
@@ -250,12 +269,19 @@ dp_packet_equal(const struct dp_packet *a, const struct dp_packet *b)
            !memcmp(dp_packet_data(a), dp_packet_data(b), dp_packet_size(a));
 }
 
-/* Get the start of the Ethernet frame.  'l3_ofs' marks the end of the l2
+static inline bool
+dp_packet_is_eth(const struct dp_packet *b)
+{
+    return b->packet_type == htonl(PT_ETH);
+}
+
+/* Get the start of the Ethernet frame. 'l3_ofs' marks the end of the l2
  * headers, so return NULL if it is not set. */
 static inline void *
-dp_packet_l2(const struct dp_packet *b)
+dp_packet_eth(const struct dp_packet *b)
 {
-    return (b->l3_ofs != UINT16_MAX) ? dp_packet_data(b) : NULL;
+    return (dp_packet_is_eth(b) && b->l3_ofs != UINT16_MAX)
+            ? dp_packet_data(b) : NULL;
 }
 
 /* Resets all layer offsets.  'l3' offset must be set before 'l2' can be
@@ -489,6 +515,40 @@ dp_packet_set_allocated(struct dp_packet *b, uint16_t s)
 }
 #endif
 
+static inline void
+dp_packet_reset_cutlen(struct dp_packet *b)
+{
+    b->cutlen = 0;
+}
+
+static inline uint32_t
+dp_packet_set_cutlen(struct dp_packet *b, uint32_t max_len)
+{
+    if (max_len < ETH_HEADER_LEN) {
+        max_len = ETH_HEADER_LEN;
+    }
+
+    if (max_len >= dp_packet_size(b)) {
+        b->cutlen = 0;
+    } else {
+        b->cutlen = dp_packet_size(b) - max_len;
+    }
+    return b->cutlen;
+}
+
+static inline uint32_t
+dp_packet_get_cutlen(const struct dp_packet *b)
+{
+    /* Always in valid range if user uses dp_packet_set_cutlen. */
+    return b->cutlen;
+}
+
+static inline uint32_t
+dp_packet_get_send_len(const struct dp_packet *b)
+{
+    return dp_packet_size(b) - dp_packet_get_cutlen(b);
+}
+
 static inline void *
 dp_packet_data(const struct dp_packet *b)
 {
@@ -511,9 +571,11 @@ dp_packet_reset_packet(struct dp_packet *b, int off)
 {
     dp_packet_set_size(b, dp_packet_size(b) - off);
     dp_packet_set_data(b, ((unsigned char *) dp_packet_data(b) + off));
-    b->l2_5_ofs = b->l3_ofs = b->l4_ofs = UINT16_MAX;
+    dp_packet_reset_offsets(b);
 }
 
+/* Returns the RSS hash of the packet 'p'.  Note that the returned value is
+ * correct only if 'dp_packet_rss_valid(p)' returns true */
 static inline uint32_t
 dp_packet_get_rss_hash(struct dp_packet *p)
 {
@@ -529,9 +591,255 @@ dp_packet_set_rss_hash(struct dp_packet *p, uint32_t hash)
 {
 #ifdef DPDK_NETDEV
     p->mbuf.hash.rss = hash;
+    p->mbuf.ol_flags |= PKT_RX_RSS_HASH;
 #else
     p->rss_hash = hash;
+    p->rss_hash_valid = true;
 #endif
+}
+
+static inline bool
+dp_packet_rss_valid(struct dp_packet *p)
+{
+#ifdef DPDK_NETDEV
+    return p->mbuf.ol_flags & PKT_RX_RSS_HASH;
+#else
+    return p->rss_hash_valid;
+#endif
+}
+
+static inline void
+dp_packet_rss_invalidate(struct dp_packet *p OVS_UNUSED)
+{
+#ifndef DPDK_NETDEV
+    p->rss_hash_valid = false;
+#endif
+}
+
+static inline void
+dp_packet_mbuf_rss_flag_reset(struct dp_packet *p OVS_UNUSED)
+{
+#ifdef DPDK_NETDEV
+    p->mbuf.ol_flags &= ~PKT_RX_RSS_HASH;
+#endif
+}
+
+/* This initialization is needed for packets that do not come
+ * from DPDK interfaces, when vswitchd is built with --with-dpdk.
+ * The DPDK rte library will still otherwise manage the mbuf.
+ * We only need to initialize the mbuf ol_flags. */
+static inline void
+dp_packet_mbuf_init(struct dp_packet *p OVS_UNUSED)
+{
+#ifdef DPDK_NETDEV
+    p->mbuf.ol_flags = 0;
+#endif
+}
+
+static inline bool
+dp_packet_ip_checksum_valid(struct dp_packet *p OVS_UNUSED)
+{
+#ifdef DPDK_NETDEV
+    return (p->mbuf.ol_flags & PKT_RX_IP_CKSUM_MASK) ==
+            PKT_RX_IP_CKSUM_GOOD;
+#else
+    return false;
+#endif
+}
+
+static inline bool
+dp_packet_ip_checksum_bad(struct dp_packet *p OVS_UNUSED)
+{
+#ifdef DPDK_NETDEV
+    return (p->mbuf.ol_flags & PKT_RX_IP_CKSUM_MASK) ==
+            PKT_RX_IP_CKSUM_BAD;
+#else
+    return false;
+#endif
+}
+
+static inline bool
+dp_packet_l4_checksum_valid(struct dp_packet *p OVS_UNUSED)
+{
+#ifdef DPDK_NETDEV
+    return (p->mbuf.ol_flags & PKT_RX_L4_CKSUM_MASK) ==
+            PKT_RX_L4_CKSUM_GOOD;
+#else
+    return false;
+#endif
+}
+
+static inline bool
+dp_packet_l4_checksum_bad(struct dp_packet *p OVS_UNUSED)
+{
+#ifdef DPDK_NETDEV
+    return (p->mbuf.ol_flags & PKT_RX_L4_CKSUM_MASK) ==
+            PKT_RX_L4_CKSUM_BAD;
+#else
+    return false;
+#endif
+}
+
+#ifdef DPDK_NETDEV
+static inline void
+reset_dp_packet_checksum_ol_flags(struct dp_packet *p)
+{
+    p->mbuf.ol_flags &= ~(PKT_RX_L4_CKSUM_GOOD | PKT_RX_L4_CKSUM_BAD |
+                          PKT_RX_IP_CKSUM_GOOD | PKT_RX_IP_CKSUM_BAD);
+}
+#else
+#define reset_dp_packet_checksum_ol_flags(arg)
+#endif
+
+enum { NETDEV_MAX_BURST = 32 }; /* Maximum number packets in a batch. */
+
+struct dp_packet_batch {
+    size_t count;
+    bool trunc; /* true if the batch needs truncate. */
+    struct dp_packet *packets[NETDEV_MAX_BURST];
+};
+
+static inline void
+dp_packet_batch_init(struct dp_packet_batch *batch)
+{
+    batch->count = 0;
+    batch->trunc = false;
+}
+
+static inline void
+dp_packet_batch_add__(struct dp_packet_batch *batch,
+                      struct dp_packet *packet, size_t limit)
+{
+    if (batch->count < limit) {
+        batch->packets[batch->count++] = packet;
+    } else {
+        dp_packet_delete(packet);
+    }
+}
+
+/* When the batch is full, 'packet' will be dropped and freed. */
+static inline void
+dp_packet_batch_add(struct dp_packet_batch *batch, struct dp_packet *packet)
+{
+    dp_packet_batch_add__(batch, packet, NETDEV_MAX_BURST);
+}
+
+static inline size_t
+dp_packet_batch_size(const struct dp_packet_batch *batch)
+{
+    return batch->count;
+}
+
+/* Clear 'batch' for refill. Use dp_packet_batch_refill() to add
+ * packets back into the 'batch'. */
+static inline void
+dp_packet_batch_refill_init(struct dp_packet_batch *batch)
+{
+    batch->count = 0;
+};
+
+static inline void
+dp_packet_batch_refill(struct dp_packet_batch *batch,
+                       struct dp_packet *packet, size_t idx)
+{
+    dp_packet_batch_add__(batch, packet, MIN(NETDEV_MAX_BURST, idx + 1));
+}
+
+static inline void
+dp_packet_batch_init_packet(struct dp_packet_batch *batch, struct dp_packet *p)
+{
+    dp_packet_batch_init(batch);
+    batch->count = 1;
+    batch->packets[0] = p;
+}
+
+static inline bool
+dp_packet_batch_is_empty(const struct dp_packet_batch *batch)
+{
+    return !dp_packet_batch_size(batch);
+}
+
+#define DP_PACKET_BATCH_FOR_EACH(IDX, PACKET, BATCH)                \
+    for (size_t IDX = 0; IDX < dp_packet_batch_size(BATCH); IDX++)  \
+        if (PACKET = BATCH->packets[IDX], true)
+
+/* Use this macro for cases where some packets in the 'BATCH' may be
+ * dropped after going through each packet in the 'BATCH'.
+ *
+ * For packets to stay in the 'BATCH', they need to be refilled back
+ * into the 'BATCH' by calling dp_packet_batch_refill(). Caller owns
+ * the packets that are not refilled.
+ *
+ * Caller needs to supply 'SIZE', that stores the current number of
+ * packets in 'BATCH'. It is best to declare this variable with
+ * the 'const' modifier since it should not be modified by
+ * the iterator.  */
+#define DP_PACKET_BATCH_REFILL_FOR_EACH(IDX, SIZE, PACKET, BATCH)       \
+    for (dp_packet_batch_refill_init(BATCH), IDX=0; IDX < SIZE; IDX++)  \
+         if (PACKET = BATCH->packets[IDX], true)
+
+static inline void
+dp_packet_batch_clone(struct dp_packet_batch *dst,
+                      struct dp_packet_batch *src)
+{
+    struct dp_packet *packet;
+
+    dp_packet_batch_init(dst);
+    DP_PACKET_BATCH_FOR_EACH (i, packet, src) {
+        dp_packet_batch_add(dst, dp_packet_clone(packet));
+    }
+    dst->trunc = src->trunc;
+}
+
+static inline void
+dp_packet_delete_batch(struct dp_packet_batch *batch, bool may_steal)
+{
+    if (may_steal) {
+        struct dp_packet *packet;
+
+        DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+            dp_packet_delete(packet);
+        }
+        dp_packet_batch_init(batch);
+    }
+}
+
+static inline void
+dp_packet_batch_init_packet_fields(struct dp_packet_batch *batch)
+{
+    struct dp_packet *packet;
+
+    DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+        dp_packet_reset_cutlen(packet);
+        packet->packet_type = htonl(PT_ETH);
+    }
+}
+
+static inline void
+dp_packet_batch_apply_cutlen(struct dp_packet_batch *batch)
+{
+    if (batch->trunc) {
+        struct dp_packet *packet;
+
+        DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+            dp_packet_set_size(packet, dp_packet_get_send_len(packet));
+            dp_packet_reset_cutlen(packet);
+        }
+        batch->trunc = false;
+    }
+}
+
+static inline void
+dp_packet_batch_reset_cutlen(struct dp_packet_batch *batch)
+{
+    if (batch->trunc) {
+        struct dp_packet *packet;
+
+        DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+            dp_packet_reset_cutlen(packet);
+        }
+        batch->trunc = false;
+    }
 }
 
 #ifdef  __cplusplus

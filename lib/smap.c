@@ -1,4 +1,4 @@
-/* Copyright (c) 2012, 2014 Nicira, Inc.
+/* Copyright (c) 2012, 2014, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,10 @@
 #include <strings.h>
 
 #include "hash.h"
-#include "json.h"
+#include "openvswitch/json.h"
+#include "packets.h"
+#include "util.h"
+#include "uuid.h"
 
 static struct smap_node *smap_add__(struct smap *, char *, void *,
                                     size_t hash);
@@ -94,10 +97,29 @@ smap_add_format(struct smap *smap, const char *key, const char *format, ...)
                hash_bytes(key, key_len, 0));
 }
 
+/* Adds 'key' paired with a string representation of 'addr'. It is the
+ * caller's responsibility to avoid duplicate keys if desirable. */
+void
+smap_add_ipv6(struct smap *smap, const char *key, struct in6_addr *addr)
+{
+    char buf[INET6_ADDRSTRLEN];
+    ipv6_string_mapped(buf, addr);
+    smap_add(smap, key, buf);
+}
+
 /* Searches for 'key' in 'smap'.  If it does not already exists, adds it.
- * Otherwise, changes its value to 'value'. */
+ * Otherwise, changes its value to 'value'.  The caller retains ownership of
+ * 'value'. */
 void
 smap_replace(struct smap *smap, const char *key, const char *value)
+{
+    smap_replace_nocopy(smap, key, xstrdup(value));
+}
+
+/* Searches for 'key' in 'smap'.  If it does not already exists, adds it.
+ * Otherwise, changes its value to 'value'.  Takes ownership of 'value'. */
+void
+smap_replace_nocopy(struct smap *smap, const char *key, char *value)
 {
     size_t  key_len = strlen(key);
     size_t hash = hash_bytes(key, key_len, 0);
@@ -107,9 +129,9 @@ smap_replace(struct smap *smap, const char *key, const char *value)
     node = smap_find__(smap, key, key_len, hash);
     if (node) {
         free(node->value);
-        node->value = xstrdup(value);
+        node->value = value;
     } else {
-        smap_add__(smap, xmemdup0(key, key_len), xstrdup(value), hash);
+        smap_add__(smap, xmemdup0(key, key_len), value, hash);
     }
 }
 
@@ -170,12 +192,21 @@ smap_clear(struct smap *smap)
     }
 }
 
-/* Returns the value associated with 'key' in 'smap', or NULL. */
+/* Returns the value associated with 'key' in 'smap'.
+ * If 'smap' does not contain 'key', returns NULL. */
 const char *
 smap_get(const struct smap *smap, const char *key)
 {
+    return smap_get_def(smap, key, NULL);
+}
+
+/* Returns the value associated with 'key' in 'smap'.
+ * If 'smap' does not contain 'key', returns 'def'. */
+const char *
+smap_get_def(const struct smap *smap, const char *key, const char *def)
+{
     struct smap_node *node = smap_get_node(smap, key);
-    return node ? node->value : NULL;
+    return node ? node->value : def;
 }
 
 /* Returns the node associated with 'key' in 'smap', or NULL. */
@@ -192,12 +223,7 @@ smap_get_node(const struct smap *smap, const char *key)
 bool
 smap_get_bool(const struct smap *smap, const char *key, bool def)
 {
-    const char *value = smap_get(smap, key);
-
-    if (!value) {
-        return def;
-    }
-
+    const char *value = smap_get_def(smap, key, "");
     if (def) {
         return strcasecmp("false", value) != 0;
     } else {
@@ -205,14 +231,46 @@ smap_get_bool(const struct smap *smap, const char *key, bool def)
     }
 }
 
-/* Gets the value associated with 'key' in 'smap' and converts it to an int
- * using atoi().  If 'key' is not in 'smap', returns 'def'. */
+/* Gets the value associated with 'key' in 'smap' and converts it to an int.
+ * If 'key' is not in 'smap' or a valid integer can't be parsed from it's
+ * value, returns 'def'. */
 int
 smap_get_int(const struct smap *smap, const char *key, int def)
 {
     const char *value = smap_get(smap, key);
+    int i_value;
 
-    return value ? atoi(value) : def;
+    if (!value || !str_to_int(value, 10, &i_value)) {
+        return def;
+    }
+
+    return i_value;
+}
+
+/* Gets the value associated with 'key' in 'smap' and converts it to an
+ * unsigned long long.  If 'key' is not in 'smap' or a valid number can't be
+ * parsed from it's value, returns 'def'. */
+unsigned long long int
+smap_get_ullong(const struct smap *smap, const char *key,
+                unsigned long long def)
+{
+    const char *value = smap_get(smap, key);
+    unsigned long long ull_value;
+
+    if (!value || !str_to_ullong(value, 10, &ull_value)) {
+        return def;
+    }
+
+    return ull_value;
+}
+
+/* Gets the value associated with 'key' in 'smap' and converts it to a UUID
+ * using uuid_from_string().  Returns true if successful, false if 'key' is not
+ * in 'smap' or if 'key' does not have the correct syntax for a UUID. */
+bool
+smap_get_uuid(const struct smap *smap, const char *key, struct uuid *uuid)
+{
+    return uuid_from_string(uuid, smap_get_def(smap, key, ""));
 }
 
 /* Returns true of there are no elements in 'smap'. */
@@ -301,6 +359,26 @@ smap_to_json(const struct smap *smap)
         json_object_put_string(json, node->key, node->value);
     }
     return json;
+}
+
+/* Returns true if the two maps are equal, meaning that they have the same set
+ * of key-value pairs.
+ */
+bool
+smap_equal(const struct smap *smap1, const struct smap *smap2)
+{
+    if (smap_count(smap1) != smap_count(smap2)) {
+        return false;
+    }
+
+    const struct smap_node *node;
+    SMAP_FOR_EACH (node, smap1) {
+        const char *value2 = smap_get(smap2, node->key);
+        if (!value2 || strcmp(node->value, value2)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Private Helpers. */

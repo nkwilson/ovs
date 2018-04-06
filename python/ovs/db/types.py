@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2010, 2011, 2012, 2013 Nicira, Inc.
+# Copyright (c) 2009, 2010, 2011, 2012, 2013, 2016 Nicira, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,10 +15,12 @@
 import sys
 import uuid
 
-from ovs.db import error
-import ovs.db.parser
 import ovs.db.data
+import ovs.db.parser
 import ovs.ovsuuid
+from ovs.db import error
+
+import six
 
 
 class AtomicType(object):
@@ -37,7 +39,7 @@ class AtomicType(object):
 
     @staticmethod
     def from_json(json):
-        if type(json) not in [str, unicode]:
+        if not isinstance(json, six.string_types):
             raise error.Error("atomic-type expected", json)
         else:
             return AtomicType.from_string(json)
@@ -54,11 +56,16 @@ class AtomicType(object):
     def default_atom(self):
         return ovs.db.data.Atom(self, self.default)
 
+
+REAL_PYTHON_TYPES = list(six.integer_types)
+REAL_PYTHON_TYPES.extend([float])
+REAL_PYTHON_TYPES = tuple(REAL_PYTHON_TYPES)
+
 VoidType = AtomicType("void", None, ())
-IntegerType = AtomicType("integer", 0, (int, long))
-RealType = AtomicType("real", 0.0, (int, long, float))
+IntegerType = AtomicType("integer", 0, six.integer_types)
+RealType = AtomicType("real", 0.0, REAL_PYTHON_TYPES)
 BooleanType = AtomicType("boolean", False, (bool,))
-StringType = AtomicType("string", "", (str, unicode))
+StringType = AtomicType("string", "", six.string_types)
 UuidType = AtomicType("uuid", ovs.ovsuuid.zero(), (uuid.UUID,))
 
 ATOMIC_TYPES = [VoidType, IntegerType, RealType, BooleanType, StringType,
@@ -113,7 +120,7 @@ def returnUnchanged(x):
 
 class BaseType(object):
     def __init__(self, type_, enum=None, min=None, max=None,
-                 min_length=0, max_length=sys.maxint, ref_table_name=None):
+                 min_length=0, max_length=sys.maxsize, ref_table_name=None):
         assert isinstance(type_, AtomicType)
         self.type = type_
         self.enum = enum
@@ -148,7 +155,7 @@ class BaseType(object):
 
     @staticmethod
     def __parse_uint(parser, name, default):
-        value = parser.get_optional(name, [int, long])
+        value = parser.get_optional(name, six.integer_types)
         if value is None:
             value = default
         else:
@@ -160,11 +167,12 @@ class BaseType(object):
 
     @staticmethod
     def from_json(json):
-        if type(json) in [str, unicode]:
+        if isinstance(json, six.string_types):
             return BaseType(AtomicType.from_json(json))
 
         parser = ovs.db.parser.Parser(json, "ovsdb type")
-        atomic_type = AtomicType.from_json(parser.get("type", [str, unicode]))
+        atomic_type = AtomicType.from_json(parser.get("type",
+                                                      six.string_types))
 
         base = BaseType(atomic_type)
 
@@ -173,27 +181,28 @@ class BaseType(object):
             base.enum = ovs.db.data.Datum.from_json(
                     BaseType.get_enum_type(base.type), enum)
         elif base.type == IntegerType:
-            base.min = parser.get_optional("minInteger", [int, long])
-            base.max = parser.get_optional("maxInteger", [int, long])
+            base.min = parser.get_optional("minInteger", six.integer_types)
+            base.max = parser.get_optional("maxInteger", six.integer_types)
             if (base.min is not None and base.max is not None
                     and base.min > base.max):
                 raise error.Error("minInteger exceeds maxInteger", json)
         elif base.type == RealType:
-            base.min = parser.get_optional("minReal", [int, long, float])
-            base.max = parser.get_optional("maxReal", [int, long, float])
+            base.min = parser.get_optional("minReal", REAL_PYTHON_TYPES)
+            base.max = parser.get_optional("maxReal", REAL_PYTHON_TYPES)
             if (base.min is not None and base.max is not None
                     and base.min > base.max):
                 raise error.Error("minReal exceeds maxReal", json)
         elif base.type == StringType:
             base.min_length = BaseType.__parse_uint(parser, "minLength", 0)
             base.max_length = BaseType.__parse_uint(parser, "maxLength",
-                                                    sys.maxint)
+                                                    sys.maxsize)
             if base.min_length > base.max_length:
                 raise error.Error("minLength exceeds maxLength", json)
         elif base.type == UuidType:
             base.ref_table_name = parser.get_optional("refTable", ['id'])
             if base.ref_table_name:
-                base.ref_type = parser.get_optional("refType", [str, unicode],
+                base.ref_type = parser.get_optional("refType",
+                                                    six.string_types,
                                                    "strong")
                 if base.ref_type not in ['strong', 'weak']:
                     raise error.Error('refType must be "strong" or "weak" '
@@ -224,7 +233,7 @@ class BaseType(object):
         elif self.type == StringType:
             if self.min_length != 0:
                 json['minLength'] = self.min_length
-            if self.max_length != sys.maxint:
+            if self.max_length != sys.maxsize:
                 json['maxLength'] = self.max_length
         elif self.type == UuidType:
             if self.ref_table_name:
@@ -252,7 +261,7 @@ class BaseType(object):
     def has_constraints(self):
         return (self.enum is not None or self.min is not None or
                 self.max is not None or
-                self.min_length != 0 or self.max_length != sys.maxint or
+                self.min_length != 0 or self.max_length != sys.maxsize or
                 self.ref_table_name is not None)
 
     def without_constraints(self):
@@ -262,7 +271,7 @@ class BaseType(object):
     def get_enum_type(atomic_type):
         """Returns the type of the 'enum' member for a BaseType whose
         'type' is 'atomic_type'."""
-        return Type(BaseType(atomic_type), None, 1, sys.maxint)
+        return Type(BaseType(atomic_type), None, 1, sys.maxsize)
 
     def is_ref(self):
         return self.type == UuidType and self.ref_table_name is not None
@@ -287,6 +296,7 @@ class BaseType(object):
         if self.enum:
             literals = [value.toEnglish(escapeLiteral)
                         for value in self.enum.values]
+            literals.sort()
             if len(literals) == 1:
                 english = 'must be %s' % (literals[0])
             elif len(literals) == 2:
@@ -314,7 +324,7 @@ class BaseType(object):
                 english = 'at most %s' % escapeNumber(commafy(self.max))
             else:
                 english = 'at most %s' % escapeNumber("%g" % self.max)
-        elif self.min_length != 0 and self.max_length != sys.maxint:
+        elif self.min_length != 0 and self.max_length != sys.maxsize:
             if self.min_length == self.max_length:
                 english = ('exactly %s characters long'
                            % commafy(self.min_length))
@@ -324,15 +334,18 @@ class BaseType(object):
                            commafy(self.max_length)))
         elif self.min_length != 0:
             return 'at least %s characters long' % commafy(self.min_length)
-        elif self.max_length != sys.maxint:
+        elif self.max_length != sys.maxsize:
             english = 'at most %s characters long' % commafy(self.max_length)
         else:
             english = ''
 
         return english
 
-    def toCType(self, prefix):
+    def toCType(self, prefix, refTable=True):
         if self.ref_table_name:
+            if not refTable:
+                assert self.type == UuidType
+                return 'struct uuid *'
             return "struct %s%s *" % (prefix, self.ref_table_name.lower())
         else:
             return {IntegerType: 'int64_t ',
@@ -341,21 +354,37 @@ class BaseType(object):
                     BooleanType: 'bool ',
                     StringType: 'char *'}[self.type]
 
+    def to_const_c_type(self, prefix, refTable=True):
+        nonconst = self.toCType(prefix, refTable)
+
+        # A "const" prefix works OK for the types we use, but it's a little
+        # weird to write "const bool" as, e.g., a function parameter since
+        # there's no real "const"ness there.  So, omit the "const" except
+        # when a pointer is involved.
+        if '*' in nonconst:
+            return 'const ' + nonconst
+        else:
+            return nonconst
+
     def toAtomicType(self):
         return "OVSDB_TYPE_%s" % self.type.to_string().upper()
 
-    def copyCValue(self, dst, src):
+    def copyCValue(self, dst, src, refTable=True):
         args = {'dst': dst, 'src': src}
         if self.ref_table_name:
+            if not refTable:
+                return "%(dst)s = *%(src)s;" % args
             return ("%(dst)s = %(src)s->header_.uuid;") % args
         elif self.type == StringType:
             return "%(dst)s = xstrdup(%(src)s);" % args
         else:
             return "%(dst)s = %(src)s;" % args
 
-    def assign_c_value_casting_away_const(self, dst, src):
+    def assign_c_value_casting_away_const(self, dst, src, refTable=True):
         args = {'dst': dst, 'src': src}
         if self.ref_table_name:
+            if not refTable:
+                return "%(dst)s = *%(src)s;" % args
             return ("%(dst)s = %(src)s->header_.uuid;") % args
         elif self.type == StringType:
             return "%(dst)s = CONST_CAST(char *, %(src)s);" % args
@@ -375,40 +404,50 @@ class BaseType(object):
                        StringType: '%s = NULL;'}[self.type]
             return pattern % var
 
-    def cInitBaseType(self, indent, var):
-        stmts = []
-        stmts.append('ovsdb_base_type_init(&%s, %s);' % (
-                var, self.toAtomicType()))
+    def cInitBaseType(self, prefix, prereqs):
+        init = [".type = %s," % self.toAtomicType()]
         if self.enum:
-            stmts.append("%s.enum_ = xmalloc(sizeof *%s.enum_);"
-                         % (var, var))
-            stmts += self.enum.cInitDatum("%s.enum_" % var)
+            datum_name = "%s_enum" % prefix
+            init += [".enum_ = &%s," % datum_name]
+            prereqs += self.enum.cDeclareDatum(datum_name)
         if self.type == IntegerType:
-            if self.min is not None:
-                stmts.append('%s.u.integer.min = INT64_C(%d);'
-                        % (var, self.min))
-            if self.max is not None:
-                stmts.append('%s.u.integer.max = INT64_C(%d);'
-                        % (var, self.max))
+            if self.min is None:
+                low = "INT64_MIN"
+            else:
+                low = "INT64_C(%d)" % self.min
+            if self.max is None:
+                high = "INT64_MAX"
+            else:
+                high = "INT64_C(%d)" % self.max
+            init.append(".u.integer = { .min = %s, .max = %s }," % (low, high))
         elif self.type == RealType:
-            if self.min is not None:
-                stmts.append('%s.u.real.min = %d;' % (var, self.min))
-            if self.max is not None:
-                stmts.append('%s.u.real.max = %d;' % (var, self.max))
+            if self.min is None:
+                low = "-DBL_MAX"
+            else:
+                low = self.min
+            if self.max is None:
+                high = "DBL_MAX"
+            else:
+                high = self.max
+            init.append(".u.real = { .min = %s, .max = %s }," % (low, high))
         elif self.type == StringType:
-            if self.min_length is not None:
-                stmts.append('%s.u.string.minLen = %d;'
-                        % (var, self.min_length))
-            if self.max_length != sys.maxint:
-                stmts.append('%s.u.string.maxLen = %d;'
-                        % (var, self.max_length))
+            if self.min is None:
+                low = 0
+            else:
+                low = self.min_length
+            if self.max is None:
+                high = "UINT_MAX"
+            else:
+                high = self.max_length
+            init.append(".u.string = { .minLen = %s, .maxLen = %s }," % (
+                low, high))
         elif self.type == UuidType:
             if self.ref_table_name is not None:
-                stmts.append('%s.u.uuid.refTableName = "%s";'
-                        % (var, escapeCString(self.ref_table_name)))
-                stmts.append('%s.u.uuid.refType = OVSDB_REF_%s;'
-                        % (var, self.ref_type.upper()))
-        return '\n'.join([indent + stmt for stmt in stmts])
+                init.append(".u.uuid = { .refTableName = \"%s\", "
+                            ".refType = OVSDB_REF_%s }," % (
+                                escapeCString(self.ref_table_name),
+                                self.ref_type.upper()))
+        return init
 
 
 class Type(object):
@@ -474,21 +513,25 @@ class Type(object):
     def __n_from_json(json, default):
         if json is None:
             return default
-        elif type(json) == int and 0 <= json <= sys.maxint:
+        elif isinstance(json, int) and 0 <= json <= sys.maxsize:
             return json
         else:
             raise error.Error("bad min or max value", json)
 
     @staticmethod
     def from_json(json):
-        if type(json) in [str, unicode]:
+        if isinstance(json, six.string_types):
             return Type(BaseType.from_json(json))
 
         parser = ovs.db.parser.Parser(json, "ovsdb type")
-        key_json = parser.get("key", [dict, str, unicode])
-        value_json = parser.get_optional("value", [dict, str, unicode])
+        _types = list(six.string_types)
+        _types.extend([dict])
+        key_json = parser.get("key", _types)
+        value_json = parser.get_optional("value", _types)
         min_json = parser.get_optional("min", [int])
-        max_json = parser.get_optional("max", [int, str, unicode])
+        _types = list(six.string_types)
+        _types.extend([int])
+        max_json = parser.get_optional("max", _types)
         parser.finish()
 
         key = BaseType.from_json(key_json)
@@ -500,7 +543,7 @@ class Type(object):
         n_min = Type.__n_from_json(min_json, Type.DEFAULT_MIN)
 
         if max_json == 'unlimited':
-            n_max = sys.maxint
+            n_max = sys.maxsize
         else:
             n_max = Type.__n_from_json(max_json, Type.DEFAULT_MAX)
 
@@ -518,7 +561,7 @@ class Type(object):
             json["value"] = self.value.to_json()
         if self.n_min != Type.DEFAULT_MIN:
             json["min"] = self.n_min
-        if self.n_max == sys.maxint:
+        if self.n_max == sys.maxsize:
             json["max"] = "unlimited"
         elif self.n_max != Type.DEFAULT_MAX:
             json["max"] = self.n_max
@@ -537,7 +580,7 @@ class Type(object):
             else:
                 return "optional %s" % keyName
         else:
-            if self.n_max == sys.maxint:
+            if self.n_max == sys.maxsize:
                 if self.n_min:
                     quantity = "%s or more " % commafy(self.n_min)
                 else:
@@ -582,17 +625,23 @@ class Type(object):
         else:
             return ""
 
-    def cInitType(self, indent, var):
-        initKey = self.key.cInitBaseType(indent, "%s.key" % var)
+    def cInitType(self, prefix, prereqs):
+        init = [".key = {"]
+        init += ["   " + x for x in self.key.cInitBaseType(prefix + "_key",
+                                                           prereqs)]
+        init += ["},"]
         if self.value:
-            initValue = self.value.cInitBaseType(indent, "%s.value" % var)
+            init += [".value = {"]
+            init += ["    " + x
+                     for x in self.value.cInitBaseType(prefix + "_value",
+                                                       prereqs)]
+            init += ["},"]
         else:
-            initValue = ('%sovsdb_base_type_init(&%s.value, '
-                         'OVSDB_TYPE_VOID);' % (indent, var))
-        initMin = "%s%s.n_min = %s;" % (indent, var, self.n_min)
-        if self.n_max == sys.maxint:
+            init.append(".value = OVSDB_BASE_VOID_INIT,")
+        init.append(".n_min = %s," % self.n_min)
+        if self.n_max == sys.maxsize:
             n_max = "UINT_MAX"
         else:
             n_max = self.n_max
-        initMax = "%s%s.n_max = %s;" % (indent, var, n_max)
-        return "\n".join((initKey, initValue, initMin, initMax))
+        init.append(".n_max = %s," % n_max)
+        return init

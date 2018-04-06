@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2008-2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,31 +23,30 @@
 #include <stdlib.h>
 #include <math.h>
 
-#include "ofp-util.h"
-#include "ofp-actions.h"
-#include "ofpbuf.h"
-#include "ofproto/ofproto-provider.h"
-#include "ofproto/ofproto-dpif.h"
-#include "ofproto/ofproto-dpif-rid.h"
 #include "connectivity.h"
 #include "coverage.h"
-#include "dynamic-string.h"
+#include "dp-packet.h"
 #include "flow.h"
-#include "hmap.h"
+#include "openvswitch/hmap.h"
 #include "lacp.h"
-#include "list.h"
 #include "netdev.h"
 #include "odp-util.h"
-#include "ofpbuf.h"
+#include "ofproto/ofproto-dpif.h"
+#include "ofproto/ofproto-dpif-rid.h"
+#include "ofproto/ofproto-provider.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/list.h"
+#include "openvswitch/match.h"
+#include "openvswitch/ofp-actions.h"
+#include "openvswitch/ofpbuf.h"
+#include "openvswitch/vlog.h"
 #include "packets.h"
-#include "dp-packet.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "seq.h"
-#include "match.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "timeval.h"
 #include "unixctl.h"
-#include "openvswitch/vlog.h"
+#include "util.h"
 
 VLOG_DEFINE_THIS_MODULE(bond);
 
@@ -58,6 +57,9 @@ static struct hmap *const all_bonds OVS_GUARDED_BY(rwlock) = &all_bonds__;
 /* Bit-mask for hashing a flow down to a bucket. */
 #define BOND_MASK 0xff
 #define BOND_BUCKETS (BOND_MASK + 1)
+
+/* Priority for internal rules created to handle recirculation */
+#define RECIRC_RULE_PRIORITY 20
 
 /* A hash bucket for mapping a flow to a slave.
  * "struct bond" has an array of BOND_BUCKETS of these. */
@@ -84,14 +86,14 @@ struct bond_slave {
     void *aux;                  /* Client-provided handle for this slave. */
 
     struct netdev *netdev;      /* Network device, owned by the client. */
-    unsigned int change_seq;    /* Tracks changes in 'netdev'. */
-    ofp_port_t  ofp_port;       /* OpenFlow port number. */
+    uint64_t change_seq;        /* Tracks changes in 'netdev'. */
     char *name;                 /* Name (a copy of netdev_get_name(netdev)). */
+    ofp_port_t  ofp_port;       /* OpenFlow port number. */
 
     /* Link status. */
-    long long delay_expires;    /* Time after which 'enabled' may change. */
     bool enabled;               /* May be chosen for flows? */
     bool may_enable;            /* Client considers this slave bondable. */
+    long long delay_expires;    /* Time after which 'enabled' may change. */
 
     /* Rebalancing info.  Used only by bond_rebalance(). */
     struct ovs_list bal_node;   /* In bond_rebalance()'s 'bals' list. */
@@ -140,7 +142,7 @@ struct bond {
 
     /* Interface name may not be persistent across an OS reboot, use
      * MAC address for identifing the active slave */
-    uint8_t active_slave_mac[ETH_ADDR_LEN];
+    struct eth_addr active_slave_mac;
                                /* The MAC address of the active interface. */
     /* Legacy compatibility. */
     bool lacp_fallback_ab; /* Fallback to active-backup on LACP failure. */
@@ -172,10 +174,6 @@ static void bond_link_status_update(struct bond_slave *)
     OVS_REQ_WRLOCK(rwlock);
 static void bond_choose_active_slave(struct bond *)
     OVS_REQ_WRLOCK(rwlock);
-static unsigned int bond_hash_src(const uint8_t mac[ETH_ADDR_LEN],
-                                  uint16_t vlan, uint32_t basis);
-static unsigned int bond_hash_tcp(const struct flow *, uint16_t vlan,
-                                  uint32_t basis);
 static struct bond_entry *lookup_bond_entry(const struct bond *,
                                             const struct flow *,
                                             uint16_t vlan)
@@ -187,6 +185,7 @@ static struct bond_slave *choose_output_slave(const struct bond *,
                                               struct flow_wildcards *,
                                               uint16_t vlan)
     OVS_REQ_RDLOCK(rwlock);
+static void update_recirc_rules__(struct bond *bond);
 
 /* Attempts to parse 's' as the name of a bond balancing mode.  If successful,
  * stores the mode in '*balance' and returns true.  Otherwise returns false
@@ -234,12 +233,13 @@ bond_create(const struct bond_settings *s, struct ofproto_dpif *ofproto)
     bond = xzalloc(sizeof *bond);
     bond->ofproto = ofproto;
     hmap_init(&bond->slaves);
-    list_init(&bond->enabled_slaves);
+    ovs_list_init(&bond->enabled_slaves);
     ovs_mutex_init(&bond->mutex);
     ovs_refcount_init(&bond->ref_cnt);
-
-    bond->recirc_id = 0;
     hmap_init(&bond->pr_rule_ops);
+
+    bond->active_slave_mac = eth_addr_zero;
+    bond->active_slave_changed = false;
 
     bond_reconfigure(bond, s);
     return bond;
@@ -260,8 +260,7 @@ bond_ref(const struct bond *bond_)
 void
 bond_unref(struct bond *bond)
 {
-    struct bond_slave *slave, *next_slave;
-    struct bond_pr_rule_op *pr_op, *next_op;
+    struct bond_slave *slave;
 
     if (!bond || ovs_refcount_unref_relaxed(&bond->ref_cnt) != 1) {
         return;
@@ -271,8 +270,7 @@ bond_unref(struct bond *bond)
     hmap_remove(all_bonds, &bond->hmap_node);
     ovs_rwlock_unlock(&rwlock);
 
-    HMAP_FOR_EACH_SAFE (slave, next_slave, hmap_node, &bond->slaves) {
-        hmap_remove(&bond->slaves, &slave->hmap_node);
+    HMAP_FOR_EACH_POP (slave, hmap_node, &bond->slaves) {
         /* Client owns 'slave->netdev'. */
         free(slave->name);
         free(slave);
@@ -280,19 +278,18 @@ bond_unref(struct bond *bond)
     hmap_destroy(&bond->slaves);
 
     ovs_mutex_destroy(&bond->mutex);
-    free(bond->hash);
-    free(bond->name);
 
-    HMAP_FOR_EACH_SAFE(pr_op, next_op, hmap_node, &bond->pr_rule_ops) {
-        hmap_remove(&bond->pr_rule_ops, &pr_op->hmap_node);
-        free(pr_op);
-    }
-    hmap_destroy(&bond->pr_rule_ops);
-
+    /* Free bond resources. Remove existing post recirc rules. */
     if (bond->recirc_id) {
         recirc_free_id(bond->recirc_id);
+        bond->recirc_id = 0;
     }
+    free(bond->hash);
+    bond->hash = NULL;
+    update_recirc_rules__(bond);
 
+    hmap_destroy(&bond->pr_rule_ops);
+    free(bond->name);
     free(bond);
 }
 
@@ -320,9 +317,17 @@ add_pr_rule(struct bond *bond, const struct match *match,
     hmap_insert(&bond->pr_rule_ops, &pr_op->hmap_node, hash);
 }
 
+/* This function should almost never be called directly.
+ * 'update_recirc_rules()' should be called instead.  Since
+ * this function modifies 'bond->pr_rule_ops', it is only
+ * safe when 'rwlock' is held.
+ *
+ * However, when the 'bond' is the only reference in the system,
+ * calling this function avoid acquiring lock only to satisfy
+ * lock annotation. Currently, only 'bond_unref()' calls
+ * this function directly.  */
 static void
-update_recirc_rules(struct bond *bond)
-    OVS_REQ_WRLOCK(rwlock)
+update_recirc_rules__(struct bond *bond)
 {
     struct match match;
     struct bond_pr_rule_op *pr_op, *next_op;
@@ -362,7 +367,7 @@ update_recirc_rules(struct bond *bond)
                                                    RECIRC_RULE_PRIORITY, 0,
                                                    &ofpacts, pr_op->pr_rule);
             if (error) {
-                char *err_s = match_to_string(&pr_op->match,
+                char *err_s = match_to_string(&pr_op->match, NULL,
                                               RECIRC_RULE_PRIORITY);
 
                 VLOG_ERR("failed to add post recirculation flow %s", err_s);
@@ -375,7 +380,7 @@ update_recirc_rules(struct bond *bond)
                                                       &pr_op->match,
                                                       RECIRC_RULE_PRIORITY);
             if (error) {
-                char *err_s = match_to_string(&pr_op->match,
+                char *err_s = match_to_string(&pr_op->match, NULL,
                                               RECIRC_RULE_PRIORITY);
 
                 VLOG_ERR("failed to remove post recirculation flow %s", err_s);
@@ -383,7 +388,9 @@ update_recirc_rules(struct bond *bond)
             }
 
             hmap_remove(&bond->pr_rule_ops, &pr_op->hmap_node);
-            *pr_op->pr_rule = NULL;
+            if (bond->hash) {
+                *pr_op->pr_rule = NULL;
+            }
             free(pr_op);
             break;
         }
@@ -392,6 +399,12 @@ update_recirc_rules(struct bond *bond)
     ofpbuf_uninit(&ofpacts);
 }
 
+static void
+update_recirc_rules(struct bond *bond)
+    OVS_REQ_RDLOCK(rwlock)
+{
+    update_recirc_rules__(bond);
+}
 
 /* Updates 'bond''s overall configuration to 's'.
  *
@@ -458,29 +471,24 @@ bond_reconfigure(struct bond *bond, const struct bond_settings *s)
         bond_entry_reset(bond);
     }
 
-    memcpy(bond->active_slave_mac, s->active_slave_mac,
-           sizeof s->active_slave_mac);
-
-    bond->active_slave_changed = false;
-
     ovs_rwlock_unlock(&rwlock);
     return revalidate;
 }
 
 static struct bond_slave *
-bond_find_slave_by_mac(const struct bond *bond, const uint8_t mac[ETH_ADDR_LEN])
+bond_find_slave_by_mac(const struct bond *bond, const struct eth_addr mac)
 {
     struct bond_slave *slave;
 
     /* Find the last active slave */
     HMAP_FOR_EACH(slave, hmap_node, &bond->slaves) {
-        uint8_t slave_mac[ETH_ADDR_LEN];
+        struct eth_addr slave_mac;
 
-        if (netdev_get_etheraddr(slave->netdev, slave_mac)) {
+        if (netdev_get_etheraddr(slave->netdev, &slave_mac)) {
             continue;
         }
 
-        if (!memcmp(slave_mac, mac, sizeof(slave_mac))) {
+        if (eth_addr_equals(slave_mac, mac)) {
             return slave;
         }
     }
@@ -491,10 +499,13 @@ bond_find_slave_by_mac(const struct bond *bond, const uint8_t mac[ETH_ADDR_LEN])
 static void
 bond_active_slave_changed(struct bond *bond)
 {
-    uint8_t mac[ETH_ADDR_LEN];
-
-    netdev_get_etheraddr(bond->active_slave->netdev, mac);
-    memcpy(bond->active_slave_mac, mac, sizeof bond->active_slave_mac);
+    if (bond->active_slave) {
+        struct eth_addr mac;
+        netdev_get_etheraddr(bond->active_slave->netdev, &mac);
+        bond->active_slave_mac = mac;
+    } else {
+        bond->active_slave_mac = eth_addr_zero;
+    }
     bond->active_slave_changed = true;
     seq_change(connectivity_seq_get());
 }
@@ -721,8 +732,7 @@ bond_should_send_learning_packets(struct bond *bond)
  * caller should send the composed packet on the port associated with
  * port_aux and takes ownership of the returned ofpbuf. */
 struct dp_packet *
-bond_compose_learning_packet(struct bond *bond,
-                             const uint8_t eth_src[ETH_ADDR_LEN],
+bond_compose_learning_packet(struct bond *bond, const struct eth_addr eth_src,
                              uint16_t vlan, void **port_aux)
 {
     struct bond_slave *slave;
@@ -732,7 +742,7 @@ bond_compose_learning_packet(struct bond *bond,
     ovs_rwlock_rdlock(&rwlock);
     ovs_assert(may_send_learning_packets(bond));
     memset(&flow, 0, sizeof flow);
-    memcpy(flow.dl_src, eth_src, ETH_ADDR_LEN);
+    flow.dl_src = eth_src;
     slave = choose_output_slave(bond, &flow, NULL, vlan);
 
     packet = dp_packet_new(0);
@@ -763,7 +773,7 @@ bond_compose_learning_packet(struct bond *bond,
  */
 enum bond_verdict
 bond_check_admissibility(struct bond *bond, const void *slave_,
-                         const uint8_t eth_dst[ETH_ADDR_LEN])
+                         const struct eth_addr eth_dst)
 {
     enum bond_verdict verdict = BV_DROP;
     struct bond_slave *slave;
@@ -790,7 +800,11 @@ bond_check_admissibility(struct bond *bond, const void *slave_,
         if (!bond->lacp_fallback_ab) {
             goto out;
         }
+        break;
     case LACP_DISABLED:
+        if (bond->balance == BM_TCP) {
+            goto out;
+        }
         break;
     }
 
@@ -810,6 +824,7 @@ bond_check_admissibility(struct bond *bond, const void *slave_,
         if (!bond->lacp_fallback_ab) {
             goto out;
         }
+        /* fall through */
 
     case BM_AB:
         /* Drop all packets which arrive on backup slaves.  This is similar to
@@ -909,21 +924,10 @@ bond_recirculation_account(struct bond *bond)
     }
 }
 
-bool
-bond_may_recirc(const struct bond *bond, uint32_t *recirc_id,
-                uint32_t *hash_bias)
+static bool
+bond_may_recirc(const struct bond *bond)
 {
-    if (bond->balance == BM_TCP && bond->recirc_id) {
-        if (recirc_id) {
-            *recirc_id = bond->recirc_id;
-        }
-        if (hash_bias) {
-            *hash_bias = bond->basis;
-        }
-        return true;
-    } else {
-        return false;
-    }
+    return bond->balance == BM_TCP && bond->recirc_id;
 }
 
 static void
@@ -951,12 +955,30 @@ bond_update_post_recirc_rules__(struct bond* bond, const bool force)
 }
 
 void
-bond_update_post_recirc_rules(struct bond* bond, const bool force)
+bond_update_post_recirc_rules(struct bond *bond, uint32_t *recirc_id,
+                              uint32_t *hash_basis)
 {
-    ovs_rwlock_wrlock(&rwlock);
-    bond_update_post_recirc_rules__(bond, force);
-    ovs_rwlock_unlock(&rwlock);
+    bool may_recirc = bond_may_recirc(bond);
+
+    if (may_recirc) {
+        /* To avoid unnecessary locking, bond_may_recirc() is first
+         * called outside of the 'rwlock'. After acquiring the lock,
+         * check again to make sure bond configuration has not been changed. */
+        ovs_rwlock_wrlock(&rwlock);
+        may_recirc = bond_may_recirc(bond);
+        if (may_recirc) {
+            *recirc_id = bond->recirc_id;
+            *hash_basis = bond->basis;
+            bond_update_post_recirc_rules__(bond, false);
+        }
+        ovs_rwlock_unlock(&rwlock);
+    }
+
+    if (!may_recirc) {
+        *recirc_id = *hash_basis = 0;
+    }
 }
+
 
 /* Rebalancing. */
 
@@ -1003,12 +1025,12 @@ log_bals(struct bond *bond, const struct ovs_list *bals)
             if (!slave->enabled) {
                 ds_put_cstr(&ds, " (disabled)");
             }
-            if (!list_is_empty(&slave->entries)) {
+            if (!ovs_list_is_empty(&slave->entries)) {
                 struct bond_entry *e;
 
                 ds_put_cstr(&ds, " (");
                 LIST_FOR_EACH (e, list_node, &slave->entries) {
-                    if (&e->list_node != list_front(&slave->entries)) {
+                    if (&e->list_node != ovs_list_front(&slave->entries)) {
                         ds_put_cstr(&ds, " + ");
                     }
                     ds_put_format(&ds, "h%"PRIdPTR": %"PRIu64"kB",
@@ -1061,30 +1083,31 @@ choose_entry_to_migrate(const struct bond_slave *from, uint64_t to_tx_bytes)
 {
     struct bond_entry *e;
 
-    if (list_is_short(&from->entries)) {
+    if (ovs_list_is_short(&from->entries)) {
         /* 'from' carries no more than one MAC hash, so shifting load away from
          * it would be pointless. */
         return NULL;
     }
 
     LIST_FOR_EACH (e, list_node, &from->entries) {
-        double old_ratio, new_ratio;
-        uint64_t delta;
+        uint64_t delta = e->tx_bytes;  /* The amount to rebalance.  */
+        uint64_t ideal_tx_bytes = (from->tx_bytes + to_tx_bytes)/2;
+                             /* Note, the ideal traffic is the mid point
+                              * between 'from' and 'to'. This value does
+                              * not change by rebalancing.  */
+        uint64_t new_low;    /* The lower bandwidth between 'to' and 'from'
+                                after rebalancing. */
 
-        if (to_tx_bytes == 0) {
-            /* Nothing on the new slave, move it. */
-            return e;
-        }
+        new_low = MIN(from->tx_bytes - delta, to_tx_bytes + delta);
 
-        delta = e->tx_bytes;
-        old_ratio = (double)from->tx_bytes / to_tx_bytes;
-        new_ratio = (double)(from->tx_bytes - delta) / (to_tx_bytes + delta);
-        if (old_ratio - new_ratio > 0.1
-            && fabs(new_ratio - 1.0) < fabs(old_ratio - 1.0)) {
-            /* We're aiming for an ideal ratio of 1, meaning both the 'from'
-               and 'to' slave have the same load.  Therefore, we only move an
-               entry if it decreases the load on 'from', and brings us closer
-               to equal traffic load. */
+        if ((new_low > to_tx_bytes) &&
+            (new_low - to_tx_bytes >= (ideal_tx_bytes - to_tx_bytes) / 10)) {
+            /* Only rebalance if the new 'low' is closer to to the mid point,
+             * and the improvement exceeds 10% of current traffic
+             * deviation from the ideal split.
+             *
+             * The improvement on the 'high' side is always the same as the
+             * 'low' side. Thus consider 'low' side is sufficient.  */
             return e;
         }
     }
@@ -1104,7 +1127,7 @@ insert_bal(struct ovs_list *bals, struct bond_slave *slave)
             break;
         }
     }
-    list_insert(&pos->bal_node, &slave->bal_node);
+    ovs_list_insert(&pos->bal_node, &slave->bal_node);
 }
 
 /* Removes 'slave' from its current list and then inserts it into 'bals' so
@@ -1112,7 +1135,7 @@ insert_bal(struct ovs_list *bals, struct bond_slave *slave)
 static void
 reinsert_bal(struct ovs_list *bals, struct bond_slave *slave)
 {
-    list_remove(&slave->bal_node);
+    ovs_list_remove(&slave->bal_node);
     insert_bal(bals, slave);
 }
 
@@ -1137,8 +1160,8 @@ bond_rebalance(struct bond *bond)
     }
     bond->next_rebalance = time_msec() + bond->rebalance_interval;
 
-    use_recirc = ofproto_dpif_get_support(bond->ofproto)->odp.recirc &&
-                 bond_may_recirc(bond, NULL, NULL);
+    use_recirc = bond->ofproto->backer->rt_support.odp.recirc &&
+                 bond_may_recirc(bond);
 
     if (use_recirc) {
         bond_recirculation_account(bond);
@@ -1148,12 +1171,12 @@ bond_rebalance(struct bond *bond)
      * Compute each slave's tx_bytes as the sum of its entries' tx_bytes. */
     HMAP_FOR_EACH (slave, hmap_node, &bond->slaves) {
         slave->tx_bytes = 0;
-        list_init(&slave->entries);
+        ovs_list_init(&slave->entries);
     }
     for (e = &bond->hash[0]; e <= &bond->hash[BOND_MASK]; e++) {
         if (e->slave && e->tx_bytes) {
             e->slave->tx_bytes += e->tx_bytes;
-            list_push_back(&e->slave->entries, &e->list_node);
+            ovs_list_push_back(&e->slave->entries, &e->list_node);
         }
     }
 
@@ -1161,7 +1184,7 @@ bond_rebalance(struct bond *bond)
      *
      * XXX This is O(n**2) in the number of slaves but it could be O(n lg n)
      * with a proper list sort algorithm. */
-    list_init(&bals);
+    ovs_list_init(&bals);
     HMAP_FOR_EACH (slave, hmap_node, &bond->slaves) {
         if (slave->enabled) {
             insert_bal(&bals, slave);
@@ -1170,9 +1193,9 @@ bond_rebalance(struct bond *bond)
     log_bals(bond, &bals);
 
     /* Shift load from the most-loaded slaves to the least-loaded slaves. */
-    while (!list_is_short(&bals)) {
-        struct bond_slave *from = bond_slave_from_bal_node(list_front(&bals));
-        struct bond_slave *to = bond_slave_from_bal_node(list_back(&bals));
+    while (!ovs_list_is_short(&bals)) {
+        struct bond_slave *from = bond_slave_from_bal_node(ovs_list_front(&bals));
+        struct bond_slave *to = bond_slave_from_bal_node(ovs_list_back(&bals));
         uint64_t overload;
 
         overload = from->tx_bytes - to->tx_bytes;
@@ -1194,7 +1217,7 @@ bond_rebalance(struct bond *bond)
              * We don't add the element to to->hashes.  That would only allow
              * 'e' to be migrated to another slave in this rebalancing run, and
              * there is no point in doing that. */
-            list_remove(&e->list_node);
+            ovs_list_remove(&e->list_node);
 
             /* Re-sort 'bals'. */
             reinsert_bal(&bals, from);
@@ -1203,7 +1226,7 @@ bond_rebalance(struct bond *bond)
         } else {
             /* Can't usefully migrate anything away from 'from'.
              * Don't reconsider it. */
-            list_remove(&from->bal_node);
+            ovs_list_remove(&from->bal_node);
         }
     }
 
@@ -1298,7 +1321,8 @@ bond_print_details(struct ds *ds, const struct bond *bond)
     ds_put_format(ds, "bond_mode: %s\n",
                   bond_mode_to_string(bond->balance));
 
-    may_recirc = bond_may_recirc(bond, &recirc_id, NULL);
+    may_recirc = bond_may_recirc(bond);
+    recirc_id = bond->recirc_id;
     ds_put_format(ds, "bond may use recirculation: %s, Recirc-ID : %d\n",
                   may_recirc ? "yes" : "no", may_recirc ? recirc_id: -1);
 
@@ -1327,6 +1351,9 @@ bond_print_details(struct ds *ds, const struct bond *bond)
         ds_put_cstr(ds, "<unknown>\n");
         break;
     }
+
+    ds_put_format(ds, "lacp_fallback_ab: %s\n",
+                  bond->lacp_fallback_ab ? "true" : "false");
 
     ds_put_cstr(ds, "active slave mac: ");
     ds_put_format(ds, ETH_ADDR_FMT, ETH_ADDR_ARGS(bond->active_slave_mac));
@@ -1562,7 +1589,7 @@ bond_unixctl_hash(struct unixctl_conn *conn, int argc, const char *argv[],
     const char *mac_s = argv[1];
     const char *vlan_s = argc > 2 ? argv[2] : NULL;
     const char *basis_s = argc > 3 ? argv[3] : NULL;
-    uint8_t mac[ETH_ADDR_LEN];
+    struct eth_addr mac;
     uint8_t hash;
     char *hash_cstr;
     unsigned int vlan;
@@ -1587,7 +1614,7 @@ bond_unixctl_hash(struct unixctl_conn *conn, int argc, const char *argv[],
     }
 
     if (ovs_scan(mac_s, ETH_ADDR_SCAN_FMT, ETH_ADDR_SCAN_ARGS(mac))) {
-        hash = bond_hash_src(mac, vlan, basis) & BOND_MASK;
+        hash = hash_mac(mac, vlan, basis) & BOND_MASK;
 
         hash_cstr = xasprintf("%u", hash);
         unixctl_command_reply(conn, hash_cstr);
@@ -1630,6 +1657,8 @@ bond_entry_reset(struct bond *bond)
     } else {
         free(bond->hash);
         bond->hash = NULL;
+        /* Remove existing post recirc rules. */
+        update_recirc_rules(bond);
     }
 }
 
@@ -1651,6 +1680,8 @@ bond_slave_lookup(struct bond *bond, const void *slave_)
 static void
 bond_enable_slave(struct bond_slave *slave, bool enable)
 {
+    struct bond *bond = slave->bond;
+
     slave->delay_expires = LLONG_MAX;
     if (enable != slave->enabled) {
         slave->bond->bond_revalidate = true;
@@ -1658,9 +1689,10 @@ bond_enable_slave(struct bond_slave *slave, bool enable)
 
         ovs_mutex_lock(&slave->bond->mutex);
         if (enable) {
-            list_insert(&slave->bond->enabled_slaves, &slave->list_node);
+            ovs_list_insert(&slave->bond->enabled_slaves, &slave->list_node);
         } else {
-            list_remove(&slave->list_node);
+            bond->send_learning_packets = true;
+            ovs_list_remove(&slave->list_node);
         }
         ovs_mutex_unlock(&slave->bond->mutex);
 
@@ -1705,31 +1737,13 @@ bond_link_status_update(struct bond_slave *slave)
 }
 
 static unsigned int
-bond_hash_src(const uint8_t mac[ETH_ADDR_LEN], uint16_t vlan, uint32_t basis)
-{
-    return hash_mac(mac, vlan, basis);
-}
-
-static unsigned int
-bond_hash_tcp(const struct flow *flow, uint16_t vlan, uint32_t basis)
-{
-    struct flow hash_flow = *flow;
-    hash_flow.vlan_tci = htons(vlan);
-
-    /* The symmetric quality of this hash function is not required, but
-     * flow_hash_symmetric_l4 already exists, and is sufficient for our
-     * purposes, so we use it out of convenience. */
-    return flow_hash_symmetric_l4(&hash_flow, basis);
-}
-
-static unsigned int
 bond_hash(const struct bond *bond, const struct flow *flow, uint16_t vlan)
 {
     ovs_assert(bond->balance == BM_TCP || bond->balance == BM_SLB);
 
     return (bond->balance == BM_TCP
-            ? bond_hash_tcp(flow, vlan, bond->basis)
-            : bond_hash_src(flow->dl_src, vlan, bond->basis));
+            ? flow_hash_5tuple(flow, bond->basis)
+            : hash_mac(flow->dl_src, vlan, bond->basis));
 }
 
 static struct bond_entry *
@@ -1748,13 +1762,13 @@ get_enabled_slave(struct bond *bond)
     struct ovs_list *node;
 
     ovs_mutex_lock(&bond->mutex);
-    if (list_is_empty(&bond->enabled_slaves)) {
+    if (ovs_list_is_empty(&bond->enabled_slaves)) {
         ovs_mutex_unlock(&bond->mutex);
         return NULL;
     }
 
-    node = list_pop_front(&bond->enabled_slaves);
-    list_push_back(&bond->enabled_slaves, node);
+    node = ovs_list_pop_front(&bond->enabled_slaves);
+    ovs_list_push_back(&bond->enabled_slaves, node);
     ovs_mutex_unlock(&bond->mutex);
 
     return CONTAINER_OF(node, struct bond_slave, list_node);
@@ -1788,11 +1802,11 @@ choose_output_slave(const struct bond *bond, const struct flow *flow,
             return NULL;
         }
         if (wc) {
-            flow_mask_hash_fields(flow, wc, NX_HASH_FIELDS_SYMMETRIC_L4);
+            flow_mask_hash_fields(flow, wc, NX_HASH_FIELDS_SYMMETRIC_L3L4_UDP);
         }
         /* Fall Through. */
     case BM_SLB:
-        if (wc) {
+        if (wc && balance == BM_SLB) {
             flow_mask_hash_fields(flow, wc, NX_HASH_FIELDS_ETH_SRC);
         }
         e = lookup_bond_entry(bond, flow, vlan);
@@ -1862,6 +1876,7 @@ bond_choose_active_slave(struct bond *bond)
             bond_active_slave_changed(bond);
         }
     } else if (old_active_slave) {
+        bond_active_slave_changed(bond);
         VLOG_INFO_RL(&rl, "bond %s: all interfaces disabled", bond->name);
     }
 }
@@ -1871,7 +1886,8 @@ bond_choose_active_slave(struct bond *bond)
  * If return true, 'mac' will store the bond's current active slave's
  * MAC address.  */
 bool
-bond_get_changed_active_slave(const char *name, uint8_t* mac, bool force)
+bond_get_changed_active_slave(const char *name, struct eth_addr *mac,
+                              bool force)
 {
     struct bond *bond;
 
@@ -1879,7 +1895,7 @@ bond_get_changed_active_slave(const char *name, uint8_t* mac, bool force)
     bond = bond_find(name);
     if (bond) {
         if (bond->active_slave_changed || force) {
-            memcpy(mac, bond->active_slave_mac, ETH_ADDR_LEN);
+            *mac = bond->active_slave_mac;
             bond->active_slave_changed = false;
             ovs_rwlock_unlock(&rwlock);
             return true;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015 Nicira, Inc.
+ * Copyright (c) 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,9 +26,9 @@
 #include <sys/ioctl.h>
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "perf-counter.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "util.h"
 
 static struct shash perf_counters = SHASH_INITIALIZER(&perf_counters);
@@ -146,7 +146,7 @@ perf_counters_to_ds(struct ds *ds)
  * Caller is responsible for free memory.
  */
 char *
-perf_counters_to_string()
+perf_counters_to_string(void)
 {
     struct ds ds;
 
@@ -176,7 +176,7 @@ perf_counters_clear(void)
 }
 
 void
-perf_counters_destroy()
+perf_counters_destroy(void)
 {
     struct shash_node *node, *next;
 

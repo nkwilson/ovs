@@ -26,19 +26,27 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "coverage.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
-#include "list.h"
+#include "openvswitch/list.h"
 #include "ovs-thread.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "signals.h"
 #include "socket-util.h"
+#include "timeval.h"
 #include "util.h"
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(process);
 
 COVERAGE_DEFINE(process_start);
+
+#ifdef __linux__
+#define LINUX 1
+#include <asm/param.h>
+#else
+#define LINUX 0
+#endif
 
 struct process {
     struct ovs_list node;
@@ -48,6 +56,16 @@ struct process {
     /* State. */
     bool exited;
     int status;
+};
+
+struct raw_process_info {
+    unsigned long int vsz;      /* Virtual size, in kB. */
+    unsigned long int rss;      /* Resident set size, in kB. */
+    long long int uptime;       /* ms since started. */
+    long long int cputime;      /* ms of CPU used during 'uptime'. */
+    pid_t ppid;                 /* Parent. */
+    int core_id;                /* Core id last executed on. */
+    char name[18];              /* Name. */
 };
 
 /* Pipe used to signal child termination. */
@@ -161,7 +179,7 @@ process_register(const char *name, pid_t pid)
     p->name = xstrdup(slash ? slash + 1 : name);
     p->exited = false;
 
-    list_push_back(&all_processes, &p->node);
+    ovs_list_push_back(&all_processes, &p->node);
 
     return p;
 }
@@ -275,7 +293,7 @@ void
 process_destroy(struct process *p)
 {
     if (p) {
-        list_remove(&p->node);
+        ovs_list_remove(&p->node);
         free(p->name);
         free(p);
     }
@@ -327,6 +345,181 @@ process_status(const struct process *p)
     return p->status;
 }
 
+int
+count_crashes(pid_t pid)
+{
+    char file_name[128];
+    const char *paren;
+    char line[128];
+    int crashes = 0;
+    FILE *stream;
+
+    ovs_assert(LINUX);
+
+    sprintf(file_name, "/proc/%lu/cmdline", (unsigned long int) pid);
+    stream = fopen(file_name, "r");
+    if (!stream) {
+        VLOG_WARN_ONCE("%s: open failed (%s)", file_name, ovs_strerror(errno));
+        goto exit;
+    }
+
+    if (!fgets(line, sizeof line, stream)) {
+        VLOG_WARN_ONCE("%s: read failed (%s)", file_name,
+                       feof(stream) ? "end of file" : ovs_strerror(errno));
+        goto exit_close;
+    }
+
+    paren = strchr(line, '(');
+    if (paren) {
+        int x;
+        if (ovs_scan(paren + 1, "%d", &x)) {
+            crashes = x;
+        }
+    }
+
+exit_close:
+    fclose(stream);
+exit:
+    return crashes;
+}
+
+static unsigned long long int
+ticks_to_ms(unsigned long long int ticks)
+{
+    ovs_assert(LINUX);
+
+#ifndef USER_HZ
+#define USER_HZ 100
+#endif
+
+#if USER_HZ == 100              /* Common case. */
+    return ticks * (1000 / USER_HZ);
+#else  /* Alpha and some other architectures.  */
+    double factor = 1000.0 / USER_HZ;
+    return ticks * factor + 0.5;
+#endif
+}
+
+static bool
+get_raw_process_info(pid_t pid, struct raw_process_info *raw)
+{
+    unsigned long long int vsize, rss, start_time, utime, stime;
+    long long int start_msec;
+    unsigned long ppid;
+    char file_name[128];
+    FILE *stream;
+    int n;
+
+    ovs_assert(LINUX);
+
+    sprintf(file_name, "/proc/%lu/stat", (unsigned long int) pid);
+    stream = fopen(file_name, "r");
+    if (!stream) {
+        VLOG_ERR_ONCE("%s: open failed (%s)",
+                      file_name, ovs_strerror(errno));
+        return false;
+    }
+
+    n = fscanf(stream,
+               "%*d "           /* (1. pid) */
+               "(%17[^)]) "     /* 2. process name */
+               "%*c "           /* (3. state) */
+               "%lu "           /* 4. ppid */
+               "%*d "           /* (5. pgid) */
+               "%*d "           /* (6. sid) */
+               "%*d "           /* (7. tty_nr) */
+               "%*d "           /* (8. tty_pgrp) */
+               "%*u "           /* (9. flags) */
+               "%*u "           /* (10. min_flt) */
+               "%*u "           /* (11. cmin_flt) */
+               "%*u "           /* (12. maj_flt) */
+               "%*u "           /* (13. cmaj_flt) */
+               "%llu "          /* 14. utime */
+               "%llu "          /* 15. stime */
+               "%*d "           /* (16. cutime) */
+               "%*d "           /* (17. cstime) */
+               "%*d "           /* (18. priority) */
+               "%*d "           /* (19. nice) */
+               "%*d "           /* (20. num_threads) */
+               "%*d "           /* (21. always 0) */
+               "%llu "          /* 22. start_time */
+               "%llu "          /* 23. vsize */
+               "%llu "          /* 24. rss */
+               "%*u "           /* (25. rsslim) */
+               "%*u "           /* (26. start_code) */
+               "%*u "           /* (27. end_code) */
+               "%*u "           /* (28. start_stack) */
+               "%*u "           /* (29. esp) */
+               "%*u "           /* (30. eip) */
+               "%*u "           /* (31. pending signals) */
+               "%*u "           /* (32. blocked signals) */
+               "%*u "           /* (33. ignored signals) */
+               "%*u "           /* (34. caught signals) */
+               "%*u "           /* (35. whcan) */
+               "%*u "           /* (36. always 0) */
+               "%*u "           /* (37. always 0) */
+               "%*d "           /* (38. exit_signal) */
+               "%d "            /* 39. task_cpu */
+#if 0
+               /* These are here for documentation but #if'd out to save
+                * actually parsing them from the stream for no benefit. */
+               "%*u "           /* (40. rt_priority) */
+               "%*u "           /* (41. policy) */
+               "%*llu "         /* (42. blkio_ticks) */
+               "%*lu "          /* (43. gtime) */
+               "%*ld"           /* (44. cgtime) */
+#endif
+               , raw->name, &ppid, &utime, &stime, &start_time,
+                  &vsize, &rss, &raw->core_id);
+    fclose(stream);
+    if (n != 8) {
+        VLOG_ERR_ONCE("%s: fscanf failed", file_name);
+        return false;
+    }
+
+    start_msec = get_boot_time() + ticks_to_ms(start_time);
+
+    raw->vsz = vsize / 1024;
+    raw->rss = rss * (get_page_size() / 1024);
+    raw->uptime = time_wall_msec() - start_msec;
+    raw->cputime = ticks_to_ms(utime + stime);
+    raw->ppid = ppid;
+
+    return true;
+}
+
+bool
+get_process_info(pid_t pid, struct process_info *pinfo)
+{
+    struct raw_process_info child;
+
+    ovs_assert(LINUX);
+    if (!get_raw_process_info(pid, &child)) {
+        return false;
+    }
+
+    ovs_strlcpy(pinfo->name, child.name, sizeof pinfo->name);
+    pinfo->vsz = child.vsz;
+    pinfo->rss = child.rss;
+    pinfo->booted = child.uptime;
+    pinfo->crashes = 0;
+    pinfo->uptime = child.uptime;
+    pinfo->cputime = child.cputime;
+    pinfo->core_id = child.core_id;
+
+    if (child.ppid) {
+        struct raw_process_info parent;
+
+        get_raw_process_info(child.ppid, &parent);
+        if (!strcmp(child.name, parent.name)) {
+            pinfo->booted = parent.uptime;
+            pinfo->crashes = count_crashes(child.ppid);
+        }
+    }
+
+    return true;
+}
+
 /* Given 'status', which is a process status in the form reported by waitpid(2)
  * and returned by process_status(), returns a string describing how the
  * process terminated.  The caller is responsible for freeing the string when
@@ -367,7 +560,7 @@ process_run(void)
 #ifndef _WIN32
     char buf[_POSIX_PIPE_BUF];
 
-    if (!list_is_empty(&all_processes) && read(fds[0], buf, sizeof buf) > 0) {
+    if (!ovs_list_is_empty(&all_processes) && read(fds[0], buf, sizeof buf) > 0) {
         struct process *p;
 
         LIST_FOR_EACH (p, node, &all_processes) {
@@ -389,7 +582,6 @@ process_run(void)
     }
 #endif
 }
-
 
 /* Causes the next call to poll_block() to wake up when process 'p' has
  * exited. */

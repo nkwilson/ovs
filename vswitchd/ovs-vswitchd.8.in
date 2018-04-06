@@ -19,10 +19,9 @@ A daemon that manages and controls any number of Open vSwitch switches
 on the local machine.
 .PP
 The \fIdatabase\fR argument specifies how \fBovs\-vswitchd\fR connects
-to \fBovsdb\-server\fR.  The default is \fBunix:@RUNDIR@/db.sock\fR.
-The following forms are accepted:
-.so ovsdb/remote-active.man
-.so ovsdb/remote-passive.man
+to \fBovsdb\-server\fR.  \fIdatabase\fR may be an OVSDB active or
+passive connection method, as described in \fBovsdb\fR(7).  The
+default is \fBunix:@RUNDIR@/db.sock\fR.
 .PP
 \fBovs\-vswitchd\fR retrieves its configuration from \fIdatabase\fR at
 startup.  It sets up Open vSwitch datapaths and then operates
@@ -67,9 +66,8 @@ to modify datapaths when \fBovs\-vswitchd\fR is running can interfere with
 its operation.  (\fBovs\-dpctl\fR may still be useful for diagnostics.)
 .PP
 An Open vSwitch datapath kernel module must be loaded for \fBovs\-vswitchd\fR
-to be useful.  Please refer to the \fBINSTALL.Linux\fR file included in the
-Open vSwitch distribution for instructions on how to build and load
-the Open vSwitch kernel module.
+to be useful.  Refer to the documentation for instructions on how to build and
+load the Open vSwitch kernel module.
 .PP
 .SH OPTIONS
 .IP "\fB\-\-mlockall\fR"
@@ -84,9 +82,9 @@ only allow privileged users, such as the superuser, to use it.
 unavailable or unsuccessful.
 .
 .SS "DPDK Options"
-.IP "\fB\-\-dpdk\fR"
-Initialize \fBovs\-vswitchd\fR DPDK datapath.  Refer to INSTALL.DPDK
-for details.
+For details on initializing the \fBovs\-vswitchd\fR DPDK datapath,
+refer to the documentation or \fBovs\-vswitchd.conf.db\fR(5) for
+details.
 .SS "Daemon Options"
 .ds DD \
 \fBovs\-vswitchd\fR detaches only after it has connected to the \
@@ -110,8 +108,14 @@ configuration.
 described below.  The command descriptions assume an understanding of
 how to configure Open vSwitch.
 .SS "GENERAL COMMANDS"
-.IP "\fBexit\fR"
-Causes \fBovs\-vswitchd\fR to gracefully terminate.
+.IP "\fBexit\fR \fI--cleanup\fR"
+Causes \fBovs\-vswitchd\fR to gracefully terminate. If \fI--cleanup\fR
+is specified, release datapath resources configured by \fBovs\-vswitchd\fR.
+Otherwise, datapath flows and other resources remains undeleted.
+.
+.IP "\fBqos/show-types\fR \fIinterface\fR"
+Queries the interface for a list of Quality of Service types that are
+configurable via Open vSwitch for the given \fIinterface\fR.
 .IP "\fBqos/show\fR \fIinterface\fR"
 Queries the kernel for Quality of Service configuration and statistics
 associated with the given \fIinterface\fR.
@@ -136,8 +140,21 @@ interfaces if none is given) to be \fIstatus\fR.  \fIstatus\fR can be
 .IP "\fBstp/tcn\fR [\fIbridge\fR]"
 Forces a topology change event on \fIbridge\fR if it's running STP.  This
 may cause it to send Topology Change Notifications to its peers and flush
-its MAC table..  If no \fIbridge\fR is given, forces a topology change
+its MAC table.  If no \fIbridge\fR is given, forces a topology change
 event on all bridges.
+.IP "\fBstp/show\fR [\fIbridge\fR]"
+Displays detailed information about spanning tree on the \fIbridge\fR.  If
+\fIbridge\fR is not specified, then displays detailed information about all
+bridges with STP enabled.
+.IP "\fBrstp/tcn\fR [\fIbridge\fR]"
+Forces a topology change event on \fIbridge\fR if it's running RSTP.  This
+may cause it to send Topology Change Notifications to its peers and flush
+its MAC table.  If no \fIbridge\fR is given, forces a topology change
+event on all bridges.
+.IP "\fBrstp/show\fR [\fIbridge\fR]"
+Displays detailed information about rapid spanning tree on the \fIbridge\fR.
+If \fIbridge\fR is not specified, then displays detailed information about all
+bridges with RSTP enabled.
 .SS "BRIDGE COMMANDS"
 These commands manage bridges.
 .IP "\fBfdb/flush\fR [\fIbridge\fR]"
@@ -251,12 +268,21 @@ The sum of ``emc hits'', ``masked hits'' and ``miss'' is the number of
 packets received by the datapath.  Cycles are counted using the TSC or similar
 facilities (when available on the platform).  To reset these counters use
 \fBdpif-netdev/pmd-stats-clear\fR. The duration of one cycle depends on the
-measuring infrastructure.
+measuring infrastructure. ``idle cycles'' refers to cycles spent polling
+devices but not receiving any packets. ``processing cycles'' refers to cycles
+spent polling devices and successfully receiving packets, plus the cycles
+spent processing said packets.
 .IP "\fBdpif-netdev/pmd-stats-clear\fR [\fIdp\fR]"
 Resets to zero the per pmd thread performance numbers shown by the
 \fBdpif-netdev/pmd-stats-show\fR command.  It will NOT reset datapath or
 bridge statistics, only the values shown by the above command.
+.IP "\fBdpif-netdev/pmd-rxq-show\fR [\fIdp\fR]"
+For each pmd thread of the datapath \fIdp\fR shows list of queue-ids with
+port names, which this thread polls.
+.IP "\fBdpif-netdev/pmd-rxq-rebalance\fR [\fIdp\fR]"
+Reassigns rxqs to pmds in the datapath \fIdp\fR based on their current usage.
 .
+.so lib/netdev-dpdk-unixctl.man
 .so ofproto/ofproto-dpif-unixctl.man
 .so ofproto/ofproto-unixctl.man
 .so lib/vlog-unixctl.man
@@ -279,10 +305,22 @@ documentation, both the amount of available buffering, and the length
 of time before buffers may be reused.
 .
 .PP
-Open vSwitch maintains a separate set of 256 packet buffers for each
-OpenFlow connection.  Any given packet buffer is preserved until it is
-referenced by an \fBOFPT_FLOW_MOD\fR or \fBOFPT_PACKET_OUT\fR request
-or for 5 seconds, whichever comes first.
+Open vSwitch does not maintains any packet buffers.
+.
+.SS "Bundle lifetime"
+The OpenFlow specification, version 1.4, says:
+.
+.IP
+If the switch does not receive any OFPT_BUNDLE_CONTROL or
+OFPT_BUNDLE_ADD_MESSAGE message for an opened bundle_id for a switch
+defined time greater than 1s, it may send an ofp_error_msg with
+OFPET_BUNDLE_FAILED type and OFPBFC_TIMEOUT code.  If the switch does
+not receive any new message in a bundle apart from echo request and
+replies for a switch defined time greater than 1s, it may send an
+ofp_error_msg with OFPET_BUNDLE_FAILED type and OFPBFC_TIMEOUT code.
+.
+.PP
+Open vSwitch implements idle bundle lifetime of 10 seconds.
 .
 .SH "LIMITS"
 .
@@ -330,5 +368,4 @@ time linear in the number of flows.
 .
 .SH "SEE ALSO"
 .BR ovs\-appctl (8),
-.BR ovsdb\-server (1),
-\fBINSTALL.Linux\fR in the Open vSwitch distribution.
+.BR ovsdb\-server (1).

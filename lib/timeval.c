@@ -27,10 +27,10 @@
 #include <unistd.h>
 #include "coverage.h"
 #include "dummy.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
 #include "hash.h"
-#include "hmap.h"
+#include "openvswitch/hmap.h"
 #include "ovs-rcu.h"
 #include "ovs-thread.h"
 #include "signals.h"
@@ -41,8 +41,9 @@
 
 VLOG_DEFINE_THIS_MODULE(timeval);
 
-#ifdef _WIN32
+#if !defined(HAVE_CLOCK_GETTIME)
 typedef unsigned int clockid_t;
+static int clock_gettime(clock_t id, struct timespec *ts);
 
 #ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC 1
@@ -51,7 +52,9 @@ typedef unsigned int clockid_t;
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 2
 #endif
+#endif /* !defined(HAVE_CLOCK_GETTIME) */
 
+#ifdef _WIN32
 /* Number of 100 ns intervals from January 1, 1601 till January 1, 1970. */
 const static unsigned long long unix_epoch = 116444736000000000;
 #endif /* _WIN32 */
@@ -68,10 +71,10 @@ struct clock {
     clockid_t id;               /* CLOCK_MONOTONIC or CLOCK_REALTIME. */
 
     /* Features for use by unit tests.  Protected by 'mutex'. */
-    struct ovs_mutex mutex;
     atomic_bool slow_path;             /* True if warped or stopped. */
-    struct timespec warp OVS_GUARDED;  /* Offset added for unit tests. */
     bool stopped OVS_GUARDED;          /* Disable real-time updates if true. */
+    struct ovs_mutex mutex;
+    struct timespec warp OVS_GUARDED;  /* Offset added for unit tests. */
     struct timespec cache OVS_GUARDED; /* Last time read from kernel. */
     struct large_warp large_warp OVS_GUARDED; /* Connection information waiting
                                                  for warp response. */
@@ -168,16 +171,14 @@ time_timespec__(struct clock *c, struct timespec *ts)
     }
 }
 
-/* Stores a monotonic timer, accurate within TIME_UPDATE_INTERVAL ms, into
- * '*ts'. */
+/* Stores a monotonic timer into '*ts'. */
 void
 time_timespec(struct timespec *ts)
 {
     time_timespec__(&monotonic_clock, ts);
 }
 
-/* Stores the current time, accurate within TIME_UPDATE_INTERVAL ms, into
- * '*ts'. */
+/* Stores the current time into '*ts'. */
 void
 time_wall_timespec(struct timespec *ts)
 {
@@ -216,18 +217,41 @@ time_msec__(struct clock *c)
     return timespec_to_msec(&ts);
 }
 
-/* Returns a monotonic timer, in ms (within TIME_UPDATE_INTERVAL ms). */
+/* Returns a monotonic timer, in ms. */
 long long int
 time_msec(void)
 {
     return time_msec__(&monotonic_clock);
 }
 
-/* Returns the current time, in ms (within TIME_UPDATE_INTERVAL ms). */
+/* Returns the current time, in ms. */
 long long int
 time_wall_msec(void)
 {
     return time_msec__(&wall_clock);
+}
+
+static long long int
+time_usec__(struct clock *c)
+{
+    struct timespec ts;
+
+    time_timespec__(c, &ts);
+    return timespec_to_usec(&ts);
+}
+
+/* Returns a monotonic timer, in microseconds. */
+long long int
+time_usec(void)
+{
+    return time_usec__(&monotonic_clock);
+}
+
+/* Returns the current time, in microseconds. */
+long long int
+time_wall_usec(void)
+{
+    return time_usec__(&wall_clock);
 }
 
 /* Configures the program to die with SIGALRM 'secs' seconds from now, if
@@ -270,7 +294,7 @@ time_poll(struct pollfd *pollfds, int n_pollfds, HANDLE *handles OVS_UNUSED,
     time_init();
     coverage_clear();
     coverage_run();
-    if (*last_wakeup) {
+    if (*last_wakeup && !thread_is_pmd()) {
         log_poll_interval(*last_wakeup);
     }
     start = time_msec();
@@ -357,6 +381,18 @@ timeval_to_msec(const struct timeval *tv)
     return (long long int) tv->tv_sec * 1000 + tv->tv_usec / 1000;
 }
 
+long long int
+timespec_to_usec(const struct timespec *ts)
+{
+    return (long long int) ts->tv_sec * 1000 * 1000 + ts->tv_nsec / 1000;
+}
+
+long long int
+timeval_to_usec(const struct timeval *tv)
+{
+    return (long long int) tv->tv_sec * 1000 * 1000 + tv->tv_usec;
+}
+
 /* Returns the monotonic time at which the "time" module was initialized, in
  * milliseconds. */
 long long int
@@ -417,6 +453,34 @@ clock_gettime(clock_t id, struct timespec *ts)
 }
 #endif /* _WIN32 */
 
+#if defined(__MACH__) && !defined(HAVE_CLOCK_GETTIME)
+#include <mach/clock.h>
+#include <mach/mach.h>
+static int
+clock_gettime(clock_t id, struct timespec *ts)
+{
+    mach_timespec_t mts;
+    clock_serv_t clk;
+    clock_id_t cid;
+
+    if (id == CLOCK_MONOTONIC) {
+        cid = SYSTEM_CLOCK;
+    } else if (id == CLOCK_REALTIME) {
+        cid = CALENDAR_CLOCK;
+    } else {
+        return -1;
+    }
+
+    host_get_clock_service(mach_host_self(), cid, &clk);
+    clock_get_time(clk, &mts);
+    mach_port_deallocate(mach_task_self(), clk);
+    ts->tv_sec = mts.tv_sec;
+    ts->tv_nsec = mts.tv_nsec;
+
+    return 0;
+}
+#endif
+
 void
 xgettimeofday(struct timeval *tv)
 {
@@ -448,6 +512,25 @@ msec_to_timespec(long long int ms, struct timespec *ts)
 {
     ts->tv_sec = ms / 1000;
     ts->tv_nsec = (ms % 1000) * 1000 * 1000;
+}
+
+void
+nsec_to_timespec(long long int nsec, struct timespec *ts)
+{
+    if (!nsec) {
+        ts->tv_sec = ts->tv_nsec = 0;
+        return;
+    }
+    ts->tv_sec = nsec / (1000 * 1000 * 1000);
+
+    nsec = nsec % (1000 * 1000 * 1000);
+    /* This is to handle dates before epoch. */
+    if (OVS_UNLIKELY(nsec < 0)) {
+        nsec += 1000 * 1000 * 1000;
+        ts->tv_sec--;
+    }
+
+    ts->tv_nsec = nsec;
 }
 
 static void

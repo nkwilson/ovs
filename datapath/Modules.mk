@@ -18,6 +18,7 @@ dist_modules = $(both_modules)	# Modules to distribute
 
 openvswitch_sources = \
 	actions.c \
+	conntrack.c \
 	datapath.c \
 	dp_notify.c \
 	flow.c \
@@ -25,28 +26,28 @@ openvswitch_sources = \
 	flow_table.c \
 	vport.c \
 	vport-internal_dev.c \
-	vport-netdev.c
+	vport-netdev.c \
+	nsh.c \
+	meter.c
 
 vport_geneve_sources = vport-geneve.c
 vport_vxlan_sources = vport-vxlan.c
 vport_gre_sources = vport-gre.c
 vport_lisp_sources = vport-lisp.c
 vport_stt_sources = vport-stt.c
+nsh_sources = nsh.c
 
 openvswitch_headers = \
 	compat.h \
+	conntrack.h \
 	datapath.h \
 	flow.h \
 	flow_netlink.h \
 	flow_table.h \
-	vlan.h \
 	vport.h \
 	vport-internal_dev.h \
 	vport-netdev.h \
-	vport-vxlan.h
-
-openvswitch_extras = \
-	README.md
+	meter.h
 
 dist_sources = $(foreach module,$(dist_modules),$($(module)_sources))
 dist_headers = $(foreach module,$(dist_modules),$($(module)_headers))

@@ -20,7 +20,7 @@
 #include <stdint.h>
 #include "byte-order.h"
 #include "openvswitch/types.h"
-#include "type-props.h"
+#include "openvswitch/type-props.h"
 #include "util.h"
 
 /* Public API. */
@@ -216,6 +216,28 @@ put_32aligned_u64(ovs_32aligned_u64 *x, uint64_t value)
     x->lo = value;
 }
 
+/* Returns the value in 'x'. */
+static inline ovs_u128
+get_32aligned_u128(const ovs_32aligned_u128 *x)
+{
+    ovs_u128 u;
+    u.u32[0] = x->u32[0];
+    u.u32[1] = x->u32[1];
+    u.u32[2] = x->u32[2];
+    u.u32[3] = x->u32[3];
+    return u;
+}
+
+/* Stores 'value' in 'x'. */
+static inline void
+put_32aligned_u128(ovs_32aligned_u128 *x, ovs_u128 value)
+{
+    x->u32[0] = value.u32[0];
+    x->u32[1] = value.u32[1];
+    x->u32[2] = value.u32[2];
+    x->u32[3] = value.u32[3];
+}
+
 #ifndef __CHECKER__
 /* Returns the value of 'x'. */
 static inline ovs_be32
@@ -264,6 +286,28 @@ put_32aligned_be64(ovs_32aligned_be64 *x, ovs_be64 value)
     x->lo = value >> 32;
 #endif
 }
+
+/* Returns the value of 'x'. */
+static inline ovs_be128
+get_32aligned_be128(const ovs_32aligned_be128 *x)
+{
+    ovs_be128 u;
+    u.be32[0] = x->be32[0];
+    u.be32[1] = x->be32[1];
+    u.be32[2] = x->be32[2];
+    u.be32[3] = x->be32[3];
+    return u;
+}
+
+/* Stores network byte order 'value' into 'x'. */
+static inline void
+put_32aligned_be128(ovs_32aligned_be128 *x, ovs_be128 value)
+{
+    x->be32[0] = value.be32[0];
+    x->be32[1] = value.be32[1];
+    x->be32[2] = value.be32[2];
+    x->be32[3] = value.be32[3];
+}
 #else  /* __CHECKER__ */
 /* Making sparse happy with these functions also makes them unreadable, so
  * don't bother to show it their implementations. */
@@ -271,6 +315,8 @@ ovs_be32 get_16aligned_be32(const ovs_16aligned_be32 *);
 void put_16aligned_be32(ovs_16aligned_be32 *, ovs_be32);
 ovs_be64 get_32aligned_be64(const ovs_32aligned_be64 *);
 void put_32aligned_be64(ovs_32aligned_be64 *, ovs_be64);
+ovs_be128 get_32aligned_be128(const ovs_32aligned_be128 *);
+void put_32aligned_be128(ovs_32aligned_be128 *, ovs_be128);
 #endif
 
 #endif /* unaligned.h */

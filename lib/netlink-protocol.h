@@ -38,6 +38,7 @@
 #include <linux/genetlink.h>
 
 #else
+#define NETLINK_NETFILTER       12
 #define NETLINK_GENERIC         16
 
 /* nlmsg_flags bits. */
@@ -155,6 +156,12 @@ enum {
 #ifndef NETLINK_ADD_MEMBERSHIP
 #define NETLINK_ADD_MEMBERSHIP 1
 #define NETLINK_DROP_MEMBERSHIP 2
+#endif
+
+/* This was introduced in v4.2.  (We want our programs to support the newer
+ * kernel features even if compiled with older headers.) */
+#ifndef NETLINK_LISTEN_ALL_NSID
+#define NETLINK_LISTEN_ALL_NSID 8
 #endif
 
 /* These were introduced all together in 2.6.23.  (We want our programs to

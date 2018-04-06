@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2012, 2013, 2014, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,7 +51,7 @@ static inline uint32_t hash_pointer(const void *, uint32_t basis);
 static inline uint32_t hash_string(const char *, uint32_t basis);
 
 /* Murmurhash by Austin Appleby,
- * from http://code.google.com/p/smhasher/source/browse/trunk/MurmurHash3.cpp.
+ * from https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp
  *
  * The upstream license there says:
  *
@@ -62,6 +62,11 @@ static inline uint32_t hash_string(const char *, uint32_t basis);
 
 static inline uint32_t mhash_add__(uint32_t hash, uint32_t data)
 {
+    /* zero-valued 'data' will not change the 'hash' value */
+    if (!data) {
+        return hash;
+    }
+
     data *= 0xcc9e2d51;
     data = hash_rot(data, 15);
     data *= 0x1b873593;
@@ -84,6 +89,14 @@ static inline uint32_t mhash_finish(uint32_t hash)
     hash ^= hash >> 16;
     return hash;
 }
+
+static inline uint32_t hash_add(uint32_t hash, uint32_t data);
+static inline uint32_t hash_add64(uint32_t hash, uint64_t data);
+
+static inline uint32_t hash_add_words(uint32_t, const uint32_t *, size_t);
+static inline uint32_t hash_add_words64(uint32_t, const uint64_t *, size_t);
+static inline uint32_t hash_add_bytes32(uint32_t, const uint32_t *, size_t);
+static inline uint32_t hash_add_bytes64(uint32_t, const uint64_t *, size_t);
 
 #if !(defined(__SSE4_2__) && defined(__x86_64__))
 /* Mhash-based implementation. */
@@ -109,29 +122,15 @@ static inline uint32_t hash_finish(uint32_t hash, uint32_t final)
  * This is inlined for the compiler to have access to the 'n_words', which
  * in many cases is a constant. */
 static inline uint32_t
-hash_words_inline(const uint32_t p[], size_t n_words, uint32_t basis)
+hash_words_inline(const uint32_t *p, size_t n_words, uint32_t basis)
 {
-    uint32_t hash;
-    size_t i;
-
-    hash = basis;
-    for (i = 0; i < n_words; i++) {
-        hash = hash_add(hash, p[i]);
-    }
-    return hash_finish(hash, n_words * 4);
+    return hash_finish(hash_add_words(basis, p, n_words), n_words * 4);
 }
 
 static inline uint32_t
-hash_words64_inline(const uint64_t p[], size_t n_words, uint32_t basis)
+hash_words64_inline(const uint64_t *p, size_t n_words, uint32_t basis)
 {
-    uint32_t hash;
-    size_t i;
-
-    hash = basis;
-    for (i = 0; i < n_words; i++) {
-        hash = hash_add64(hash, p[i]);
-    }
-    return hash_finish(hash, n_words * 8);
+    return hash_finish(hash_add_words64(basis, p, n_words), n_words * 8);
 }
 
 static inline uint32_t hash_pointer(const void *p, uint32_t basis)
@@ -323,6 +322,18 @@ hash_words64(const uint64_t p[], size_t n_words, uint32_t basis)
 }
 #endif
 
+static inline uint32_t
+hash_bytes32(const uint32_t p[], size_t n_bytes, uint32_t basis)
+{
+    return hash_words(p, n_bytes / 4, basis);
+}
+
+static inline uint32_t
+hash_bytes64(const uint64_t p[], size_t n_bytes, uint32_t basis)
+{
+    return hash_words64(p, n_bytes / 8, basis);
+}
+
 static inline uint32_t hash_string(const char *s, uint32_t basis)
 {
     return hash_bytes(s, strlen(s), basis);
@@ -340,6 +351,41 @@ static inline uint32_t hash_boolean(bool x, uint32_t basis)
     const uint32_t P0 = 0xc2b73583;   /* This is hash_int(1, 0). */
     const uint32_t P1 = 0xe90f1258;   /* This is hash_int(2, 0). */
     return (x ? P0 : P1) ^ hash_rot(basis, 1);
+}
+
+/* Helper functions for calling hash_add() for several 32- or 64-bit words in a
+ * buffer.  These are not hash functions by themselves, since they need
+ * hash_finish() to be called, so if you are looking for a full hash function
+ * see hash_words(), etc. */
+
+static inline uint32_t
+hash_add_words(uint32_t hash, const uint32_t *p, size_t n_words)
+{
+    for (size_t i = 0; i < n_words; i++) {
+        hash = hash_add(hash, p[i]);
+    }
+    return hash;
+}
+
+static inline uint32_t
+hash_add_words64(uint32_t hash, const uint64_t *p, size_t n_words)
+{
+    for (size_t i = 0; i < n_words; i++) {
+        hash = hash_add64(hash, p[i]);
+    }
+    return hash;
+}
+
+static inline uint32_t
+hash_add_bytes32(uint32_t hash, const uint32_t *p, size_t n_bytes)
+{
+    return hash_add_words(hash, p, n_bytes / 4);
+}
+
+static inline uint32_t
+hash_add_bytes64(uint32_t hash, const uint64_t *p, size_t n_bytes)
+{
+    return hash_add_words64(hash, p, n_bytes / 8);
 }
 
 #ifdef __cplusplus

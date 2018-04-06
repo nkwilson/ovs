@@ -17,13 +17,13 @@
 #ifndef __VXLAN_H_
 #define __VXLAN_H_ 1
 
+#include "IpHelper.h"
 #include "NetProto.h"
+
+typedef union _OVS_FWD_INFO *POVS_FWD_INFO;
+
 typedef struct _OVS_VXLAN_VPORT {
     UINT16 dstPort;
-    UINT64 inPkts;
-    UINT64 outPkts;
-    UINT64 slowInPkts;
-    UINT64 slowOutPkts;
     UINT64 filterID;
     UINT64 ipId;
     /*
@@ -35,7 +35,8 @@ typedef struct _OVS_VXLAN_VPORT {
 typedef struct VXLANHdr {
     /* Flags. */
     UINT32   flags1:2;
-    /* Packet needs replication to multicast group (used for multicast proxy). */
+    /* Packet needs replication to multicast group (used for multicast proxy).
+     */
     UINT32   locallyReplicate:1;
     /* Instance ID flag, must be set to 1. */
     UINT32   instanceID:1;
@@ -68,7 +69,8 @@ NDIS_STATUS OvsEncapVxlan(POVS_VPORT_ENTRY vport,
                           OvsIPv4TunnelKey *tunKey,
                           POVS_SWITCH_CONTEXT switchContext,
                           POVS_PACKET_HDR_INFO layers,
-                          PNET_BUFFER_LIST *newNbl);
+                          PNET_BUFFER_LIST *newNbl,
+                          POVS_FWD_INFO switchFwdInfo);
 
 NDIS_STATUS OvsDecapVxlan(POVS_SWITCH_CONTEXT switchContext,
                           PNET_BUFFER_LIST curNbl,
@@ -81,6 +83,12 @@ OvsGetVxlanTunHdrSize(VOID)
     /* XXX: Can L2 include VLAN at all? */
     return sizeof (EthHdr) + sizeof (IPHdr) + sizeof (UDPHdr) +
            sizeof (VXLANHdr);
+}
+
+static __inline UINT32
+OvsGetVxlanTunHdrSizeFromLayers(POVS_PACKET_HDR_INFO layers)
+{
+    return layers->l7Offset + sizeof(VXLANHdr);
 }
 
 #define VXLAN_UDP_PORT 4789

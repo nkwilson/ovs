@@ -1,6 +1,6 @@
 sbin_PROGRAMS += vswitchd/ovs-vswitchd
 man_MANS += vswitchd/ovs-vswitchd.8
-DISTCLEANFILES += \
+CLEANFILES += \
 	vswitchd/ovs-vswitchd.8
 
 vswitchd_ovs_vswitchd_SOURCES = \
@@ -16,7 +16,6 @@ vswitchd_ovs_vswitchd_LDADD = \
 	lib/libsflow.la \
 	lib/libopenvswitch.la
 vswitchd_ovs_vswitchd_LDFLAGS = $(AM_LDFLAGS) $(DPDK_vswitchd_LDFLAGS)
-EXTRA_DIST += vswitchd/INTERNALS
 MAN_ROOTS += vswitchd/ovs-vswitchd.8.in
 
 # vswitch schema and IDL
@@ -32,17 +31,17 @@ if HAVE_DOT
 vswitchd/vswitch.gv: ovsdb/ovsdb-dot.in vswitchd/vswitch.ovsschema
 	$(AM_V_GEN)$(OVSDB_DOT) --no-arrows $(srcdir)/vswitchd/vswitch.ovsschema > $@
 vswitchd/vswitch.pic: vswitchd/vswitch.gv ovsdb/dot2pic
-	$(AM_V_GEN)(dot -T plain < vswitchd/vswitch.gv | $(PERL) $(srcdir)/ovsdb/dot2pic -f 3) > $@.tmp && \
+	$(AM_V_GEN)(dot -T plain < vswitchd/vswitch.gv | $(PYTHON) $(srcdir)/ovsdb/dot2pic -f 3) > $@.tmp && \
 	mv $@.tmp $@
 VSWITCH_PIC = vswitchd/vswitch.pic
 VSWITCH_DOT_DIAGRAM_ARG = --er-diagram=$(VSWITCH_PIC)
-DISTCLEANFILES += vswitchd/vswitch.gv vswitchd/vswitch.pic
+CLEANFILES += vswitchd/vswitch.gv vswitchd/vswitch.pic
 endif
 endif
 
 # vswitch schema documentation
 EXTRA_DIST += vswitchd/vswitch.xml
-DISTCLEANFILES += vswitchd/ovs-vswitchd.conf.db.5
+CLEANFILES += vswitchd/ovs-vswitchd.conf.db.5
 man_MANS += vswitchd/ovs-vswitchd.conf.db.5
 vswitchd/ovs-vswitchd.conf.db.5: \
 	ovsdb/ovsdb-doc vswitchd/vswitch.xml vswitchd/vswitch.ovsschema \
@@ -57,15 +56,7 @@ vswitchd/ovs-vswitchd.conf.db.5: \
 # Version checking for vswitch.ovsschema.
 ALL_LOCAL += vswitchd/vswitch.ovsschema.stamp
 vswitchd/vswitch.ovsschema.stamp: vswitchd/vswitch.ovsschema
-	@sum=`sed '/cksum/d' $? | cksum`; \
-	expected=`sed -n 's/.*"cksum": "\(.*\)".*/\1/p' $?`; \
-	if test "X$$sum" = "X$$expected"; then \
-	  touch $@; \
-	else \
-	  ln=`sed -n '/"cksum":/=' $?`; \
-	  echo >&2 "$?:$$ln: The checksum \"$$sum\" was calculated from the schema file and does not match cksum field in the schema file - you should probably update the version number and the checksum in the schema file with the value listed here."; \
-	  exit 1; \
-	fi
+	$(srcdir)/build-aux/cksum-schema-check $? $@
 CLEANFILES += vswitchd/vswitch.ovsschema.stamp
 
 # Clean up generated files from older OVS versions.  (This is important so that

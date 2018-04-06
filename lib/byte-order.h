@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2010, 2011, 2013 Nicira, Inc.
+ * Copyright (c) 2008, 2010, 2011, 2013, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,13 +16,14 @@
 #ifndef BYTE_ORDER_H
 #define BYTE_ORDER_H 1
 
-#include <arpa/inet.h>
 #include <sys/types.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <inttypes.h>
 #include "openvswitch/types.h"
 
 #ifndef __CHECKER__
-#ifndef _WIN32
+#if !(defined(_WIN32) || defined(htonll))
 static inline ovs_be64
 htonll(uint64_t n)
 {
@@ -34,13 +35,33 @@ ntohll(ovs_be64 n)
 {
     return htonl(1) == 1 ? n : ((uint64_t) ntohl(n) << 32) | ntohl(n >> 32);
 }
-#endif /* _WIN32 */
+#endif /* !(defined(_WIN32) || defined(htonll)) */
 #else
 /* Making sparse happy with these functions also makes them unreadable, so
  * don't bother to show it their implementations. */
 ovs_be64 htonll(uint64_t);
 uint64_t ntohll(ovs_be64);
 #endif
+
+static inline ovs_be128
+hton128(const ovs_u128 src)
+{
+    ovs_be128 dst;
+
+    dst.be64.hi = htonll(src.u64.hi);
+    dst.be64.lo = htonll(src.u64.lo);
+    return dst;
+}
+
+static inline ovs_u128
+ntoh128(const ovs_be128 src)
+{
+    ovs_u128 dst;
+
+    dst.u64.hi = ntohll(src.be64.hi);
+    dst.u64.lo = ntohll(src.be64.lo);
+    return dst;
+}
 
 static inline uint32_t
 uint32_byteswap(uint32_t crc) {
@@ -78,16 +99,50 @@ uint32_byteswap(uint32_t crc) {
          ((((ovs_be64) (VALUE)) & UINT64_C(0xff00000000000000)) >> 56))
 #endif
 
+/* Returns the ovs_be32 that you would get from:
+ *
+ *    union { uint8_t b[4]; ovs_be32 be32; } x = { .b = { b0, b1, b2, b3 } };
+ *    return x.be32;
+ *
+ * but without the undefined behavior. */
+static inline ovs_be32
+bytes_to_be32(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3)
+{
 #if WORDS_BIGENDIAN
-#define BYTES_TO_BE32(B1, B2, B3, B4) \
-    (OVS_FORCE ovs_be32)((uint32_t)(B1) << 24 | (B2) << 16 | (B3) << 8 | (B4))
-#define BE16S_TO_BE32(B1, B2) \
-    (OVS_FORCE ovs_be32)((uint32_t)(B1) << 16 | (B2))
+    uint32_t x = ((uint32_t) b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
 #else
-#define BYTES_TO_BE32(B1, B2, B3, B4) \
-    (OVS_FORCE ovs_be32)((uint32_t)(B1) | (B2) << 8 | (B3) << 16 | (B4) << 24)
-#define BE16S_TO_BE32(B1, B2) \
-    (OVS_FORCE ovs_be32)((uint32_t)(B1) | (B2) << 16)
+    uint32_t x = ((uint32_t) b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+#endif
+    return (OVS_FORCE ovs_be32) x;
+}
+
+/* These functions zero-extend big-endian values to longer ones,
+ * or truncate long big-endian value to shorter ones. */
+#ifndef __CHECKER__
+#if WORDS_BIGENDIAN
+static inline ovs_be32 be16_to_be32(ovs_be16 x) { return x; }
+static inline ovs_be64 be16_to_be64(ovs_be16 x) { return x; }
+static inline ovs_be64 be32_to_be64(ovs_be32 x) { return x; }
+static inline ovs_be32 be64_to_be32(ovs_be64 x) { return x; }
+static inline ovs_be16 be64_to_be16(ovs_be64 x) { return x; }
+static inline ovs_be16 be32_to_be16(ovs_be32 x) { return x; }
+#else /* !WORDS_BIGENDIAN */
+static inline ovs_be32 be16_to_be32(ovs_be16 x) { return (ovs_be32) x << 16; }
+static inline ovs_be64 be16_to_be64(ovs_be16 x) { return (ovs_be64) x << 48; }
+static inline ovs_be64 be32_to_be64(ovs_be32 x) { return (ovs_be64) x << 32; }
+static inline ovs_be32 be64_to_be32(ovs_be64 x) { return x >> 32; }
+static inline ovs_be16 be64_to_be16(ovs_be64 x) { return x >> 48; }
+static inline ovs_be16 be32_to_be16(ovs_be32 x) { return x >> 16; }
+#endif /* !WORDS_BIGENDIAN */
+#else /* __CHECKER__ */
+/* Making sparse happy with these functions also makes them unreadable, so
+ * don't bother to show it their implementations. */
+ovs_be32 be16_to_be32(ovs_be16);
+ovs_be64 be16_to_be64(ovs_be16);
+ovs_be64 be32_to_be64(ovs_be32);
+ovs_be32 be64_to_be32(ovs_be64);
+ovs_be16 be64_to_be16(ovs_be64);
+ovs_be16 be32_to_be16(ovs_be32);
 #endif
 
 #endif /* byte-order.h */

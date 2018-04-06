@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2013, 2014, 2015 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 #include <config.h>
 #include "netflow.h"
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -25,11 +27,11 @@
 #include "dpif.h"
 #include "flow.h"
 #include "lib/netflow.h"
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
 #include "ofproto.h"
 #include "ofproto/netflow.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "socket-util.h"
 #include "timeval.h"
 #include "util.h"
@@ -90,7 +92,7 @@ static void netflow_expire__(struct netflow *, struct netflow_flow *)
 static void netflow_run__(struct netflow *) OVS_REQUIRES(mutex);
 
 void
-netflow_mask_wc(struct flow *flow, struct flow_wildcards *wc)
+netflow_mask_wc(const struct flow *flow, struct flow_wildcards *wc)
 {
     if (flow->dl_type != htons(ETH_TYPE_IP)) {
         return;
@@ -276,7 +278,8 @@ netflow_expire__(struct netflow *nf, struct netflow_flow *nf_flow)
 }
 
 void
-netflow_flow_clear(struct netflow *nf, struct flow *flow) OVS_EXCLUDED(mutex)
+netflow_flow_clear(struct netflow *nf, const struct flow *flow)
+    OVS_EXCLUDED(mutex)
 {
     struct netflow_flow *nf_flow;
 
@@ -412,6 +415,14 @@ netflow_unref(struct netflow *nf)
         atomic_count_dec(&netflow_count);
         collectors_destroy(nf->collectors);
         ofpbuf_uninit(&nf->packet);
+
+        struct netflow_flow *nf_flow, *next;
+        HMAP_FOR_EACH_SAFE (nf_flow, next, hmap_node, &nf->flows) {
+            hmap_remove(&nf->flows, &nf_flow->hmap_node);
+            free(nf_flow);
+        }
+        hmap_destroy(&nf->flows);
+
         free(nf);
     }
 }

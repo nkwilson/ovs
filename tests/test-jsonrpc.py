@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import print_function
+
 import argparse
 import errno
 import os
@@ -51,11 +53,17 @@ def handle_rpc(rpc, msg):
 
 
 def do_listen(name):
-    error, pstream = ovs.stream.PassiveStream.open(name)
-    if error:
-        sys.stderr.write("could not listen on \"%s\": %s\n"
-                         % (name, os.strerror(error)))
-        sys.exit(1)
+    if sys.platform != 'win32' or (
+            ovs.daemon._detach and ovs.daemon._detached):
+        # On Windows the child is a new process created which should be the
+        # one that creates the PassiveStream. Without this check, the new
+        # child process will create a new PassiveStream overwriting the one
+        # that the parent process created.
+        error, pstream = ovs.stream.PassiveStream.open(name)
+        if error:
+            sys.stderr.write("could not listen on \"%s\": %s\n"
+                             % (name, os.strerror(error)))
+            sys.exit(1)
 
     ovs.daemon.daemonize()
 
@@ -86,7 +94,7 @@ def do_listen(name):
             if error:
                 rpc.close()
                 dead_rpcs.append(rpc)
-        rpcs = [rpc for rpc in rpcs if not rpc in dead_rpcs]
+        rpcs = [rpc for rpc in rpcs if rpc not in dead_rpcs]
 
         if done and not rpcs:
             break
@@ -127,7 +135,7 @@ def do_request(name, method, params_string):
         sys.stderr.write("error waiting for reply: %s\n" % os.strerror(error))
         sys.exit(1)
 
-    print ovs.json.to_string(msg.to_json())
+    print(ovs.json.to_string(msg.to_json()))
 
     rpc.close()
 
@@ -187,7 +195,7 @@ notify REMOTE METHOD PARAMS  send notification and exit
 
     command_name = args.command[0]
     args = args.command_args
-    if not command_name in commands:
+    if command_name not in commands:
         sys.stderr.write("%s: unknown command \"%s\" "
                          "(use --help for help)\n" % (argv[0], command_name))
         sys.exit(1)

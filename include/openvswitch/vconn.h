@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2008-2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,15 +18,18 @@
 #define OPENVSWITCH_VCONN_H 1
 
 #include <stdbool.h>
-#include <openvswitch/list.h>
-#include <openvswitch/types.h>
-#include <openflow/openflow.h>
+#include "openvswitch/list.h"
+#include "openvswitch/types.h"
+#include "openvswitch/ofp-protocol.h"
+#include "openflow/openflow.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct ofpbuf;
+struct ofputil_flow_stats;
+struct ofputil_flow_stats_request;
 struct pvconn;
 struct pvconn_class;
 struct vconn;
@@ -55,9 +58,14 @@ int vconn_transact(struct vconn *, struct ofpbuf *, struct ofpbuf **);
 int vconn_transact_noreply(struct vconn *, struct ofpbuf *, struct ofpbuf **);
 int vconn_transact_multiple_noreply(struct vconn *, struct ovs_list *requests,
                                     struct ofpbuf **replyp);
+
+int vconn_dump_flows(struct vconn *, const struct ofputil_flow_stats_request *,
+                     enum ofputil_protocol,
+                     struct ofputil_flow_stats **fsesp, size_t *n_fsesp);
+
 int vconn_bundle_transact(struct vconn *, struct ovs_list *requests,
                           uint16_t bundle_flags,
-                          void (*error_reporter)(const struct ofp_header *));
+                          struct ovs_list *errors);
 
 void vconn_run(struct vconn *);
 void vconn_run_wait(struct vconn *);

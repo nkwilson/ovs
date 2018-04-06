@@ -13,7 +13,7 @@
 
 PACKAGE=openvswitch
 PACKAGE_DKMS=openvswitch-datapath-dkms
-DEB_UPSTREAM_VERSION=$(shell dpkg-parsechangelog | sed -rne 's,^Version: ([0-9]:)*([^-]+).*,\2,p')
+include /usr/share/dpkg/pkg-info.mk
 
 ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
 PARALLEL = -j$(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
@@ -30,12 +30,11 @@ override_dh_autoreconf:
 	dh_autoreconf $(DH_AS_NEEDED)
 
 override_dh_auto_configure:
-	dh_auto_configure -- --enable-ssl $(DATAPATH_CONFIGURE_OPTS)
+	dh_auto_configure -- --enable-ssl --enable-shared $(DATAPATH_CONFIGURE_OPTS)
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
-	if $(MAKE) check TESTSUITEFLAGS='$(PARALLEL)' || \
-				$(MAKE) check TESTSUITEFLAGS='--recheck'; then :; \
+	if $(MAKE) check TESTSUITEFLAGS='$(PARALLEL)' RECHECK=yes; then :; \
 	else \
 		cat tests/testsuite.log; \
 		exit 1; \
@@ -49,10 +48,19 @@ override_dh_auto_clean:
 	rm -f python/ovs/*.pyc python/ovs/db/*.pyc
 	dh_auto_clean
 
-override_dh_install:
+override_dh_install-arch:
 	dh_install
 	# openvswitch-switch
 	cp debian/openvswitch-switch.template debian/openvswitch-switch/usr/share/openvswitch/switch/default.template
+
+	# ovn-host
+	cp debian/ovn-host.template debian/ovn-host/usr/share/ovn/host/default.template
+
+	# ovn-central
+	cp debian/ovn-central.template debian/ovn-central/usr/share/ovn/central/default.template
+
+override_dh_install-indep:
+	dh_install
 
 	# openvswitch-datapath-source
 	cp debian/rules.modules debian/openvswitch-datapath-source/usr/src/modules/openvswitch-datapath/debian/rules
@@ -61,28 +69,33 @@ override_dh_install:
 
 	# openvswitch-datapath-dkms
 	# setup the dirs
-	dh_installdirs -p$(PACKAGE_DKMS) usr/src/$(PACKAGE)-$(DEB_UPSTREAM_VERSION)
+	dh_installdirs -p$(PACKAGE_DKMS) usr/src/$(PACKAGE)-$(DEB_VERSION_UPSTREAM)
 
 	# copy the source
-	cd debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_UPSTREAM_VERSION) && tar xvzf $(CURDIR)/openvswitch.tar.gz && mv openvswitch/* openvswitch/.[a-z]* . && rmdir openvswitch
+	cd debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_VERSION_UPSTREAM) && tar xvzf $(CURDIR)/openvswitch.tar.gz && mv openvswitch/* openvswitch/.[a-z]* . && rmdir openvswitch
 
 	# check we can get kernel module names
 	$(MAKE) -C datapath print-build-modules
 
 	# Prepare dkms.conf from the dkms.conf.in template
-	sed "s/__VERSION__/$(DEB_UPSTREAM_VERSION)/g; s/__MODULES__/$(shell $(MAKE) -C datapath print-build-modules | grep -v make)/" debian/dkms.conf.in > debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_UPSTREAM_VERSION)/dkms.conf
+	sed "s/__VERSION__/$(DEB_VERSION_UPSTREAM)/g; s/__MODULES__/$(shell $(MAKE) -C datapath print-build-modules | grep -v make)/" debian/dkms.conf.in > debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_VERSION_UPSTREAM)/dkms.conf
 
 	# We don't need the debian folder in there, just upstream sources...
-	rm -rf debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_UPSTREAM_VERSION)/debian
+	rm -rf debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_VERSION_UPSTREAM)/debian
 	# We don't need the rhel stuff in there either
-	rm -rf debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_UPSTREAM_VERSION)/rhel
+	rm -rf debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_VERSION_UPSTREAM)/rhel
 	# And we should also clean useless license files, which are already
 	# described in our debian/copyright anyway.
-	rm -f debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_UPSTREAM_VERSION)/COPYING \
-		debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_UPSTREAM_VERSION)/xenserver/LICENSE
+	rm -f debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_VERSION_UPSTREAM)/COPYING \
+		debian/$(PACKAGE_DKMS)/usr/src/$(PACKAGE)-$(DEB_VERSION_UPSTREAM)/xenserver/LICENSE
 
 override_dh_installinit:
 	dh_installinit -R
 
 override_dh_strip:
 	dh_strip --dbg-package=openvswitch-dbg
+
+override_dh_usrlocal:
+
+override_dh_installman:
+	dh_installman --language=C

@@ -18,13 +18,13 @@
 #undef NDEBUG
 #include "odp-util.h"
 #include <stdio.h>
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "flow.h"
-#include "match.h"
-#include "ofp-parse.h"
-#include "ofpbuf.h"
+#include "openvswitch/match.h"
+#include "openvswitch/ofpbuf.h"
 #include "ovstest.h"
 #include "util.h"
+#include "openvswitch/ofp-flow.h"
 #include "openvswitch/vlog.h"
 
 static int
@@ -58,6 +58,11 @@ parse_keys(bool wc_keys)
                 .flow = &flow,
                 .support = {
                     .recirc = true,
+                    .ct_state = true,
+                    .ct_zone = true,
+                    .ct_mark = true,
+                    .ct_label = true,
+                    .max_vlan_headers = SIZE_MAX,
                 },
             };
 
@@ -82,7 +87,6 @@ parse_keys(bool wc_keys)
             /* Convert cls_rule back to odp_key. */
             ofpbuf_uninit(&odp_key);
             ofpbuf_init(&odp_key, 0);
-            odp_parms.odp_in_port = flow.in_port.odp_port;
             odp_flow_key_from_flow(&odp_parms, &odp_key);
 
             if (odp_key.size > ODPUTIL_FLOW_KEY_BYTES) {
@@ -105,6 +109,7 @@ parse_keys(bool wc_keys)
 
     next:
         ofpbuf_uninit(&odp_key);
+        ofpbuf_uninit(&odp_mask);
     }
     ds_destroy(&in);
 
@@ -133,7 +138,7 @@ parse_actions(void)
 
         /* Convert odp_actions back to string. */
         ds_init(&out);
-        format_odp_actions(&out, odp_actions.data, odp_actions.size);
+        format_odp_actions(&out, odp_actions.data, odp_actions.size, NULL);
         puts(ds_cstr(&out));
         ds_destroy(&out);
 
@@ -159,7 +164,7 @@ parse_filter(char *filter_parse)
         memset(&flow_filter, 0, sizeof(flow_filter));
         memset(&wc_filter, 0, sizeof(wc_filter));
 
-        error = parse_ofp_exact_flow(&flow_filter, &wc_filter.masks, filter,
+        error = parse_ofp_exact_flow(&flow_filter, &wc_filter, NULL, filter,
                                      NULL);
         if (error) {
             ovs_fatal(0, "Failed to parse filter (%s)", error);
@@ -173,14 +178,11 @@ parse_filter(char *filter_parse)
         struct ofpbuf odp_key;
         struct ofpbuf odp_mask;
         struct ds out;
-        int error;
 
         /* Convert string to OVS DP key. */
         ofpbuf_init(&odp_key, 0);
         ofpbuf_init(&odp_mask, 0);
-        error = odp_flow_from_string(ds_cstr(&in), NULL,
-                                     &odp_key, &odp_mask);
-        if (error) {
+        if (odp_flow_from_string(ds_cstr(&in), NULL, &odp_key, &odp_mask)) {
             printf("odp_flow_from_string: error\n");
             goto next;
         }
@@ -192,8 +194,7 @@ parse_filter(char *filter_parse)
             struct minimatch minimatch;
 
             odp_flow_key_to_flow(odp_key.data, odp_key.size, &flow);
-            odp_flow_key_to_mask(odp_mask.data, odp_mask.size, odp_key.data,
-                                 odp_key.size, &wc.masks, &flow);
+            odp_flow_key_to_mask(odp_mask.data, odp_mask.size, &wc, &flow);
             match_init(&match, &flow, &wc);
 
             match_init(&match_filter, &flow_filter, &wc);

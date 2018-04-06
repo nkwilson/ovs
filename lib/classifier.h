@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -236,7 +236,7 @@
  * The classifier supports versioning for two reasons:
  *
  *     1. Support for versioned modifications makes it possible to perform an
- *        arbitraty series of classifier changes as one atomic transaction,
+ *        arbitrary series of classifier changes as one atomic transaction,
  *        where intermediate versions of the classifier are not visible to any
  *        lookups.  Also, when a rule is added for a future version, or marked
  *        for removal after the current version, such modifications can be
@@ -284,7 +284,7 @@
  *
  * The classifier may safely be accessed by many reader threads concurrently
  * and by a single writer, or by multiple writers when they guarantee mutually
- * exlucive access to classifier modifications.
+ * exclusive access to classifier modifications.
  *
  * Since the classifier rules are RCU protected, the rule destruction after
  * removal from the classifier must be RCU postponed.  Also, when versioning is
@@ -293,17 +293,18 @@
  * ovsrcu_postpone() call to destruct the rule is called from the first RCU
  * callback that removes the rule.
  *
- * Rules that have never been visible to lookups are an exeption to the above
+ * Rules that have never been visible to lookups are an exception to the above
  * rule.  Such rules can be removed immediately, but their destruction must
  * still be RCU postponed, as the rule's visibility attribute may be examined
  * parallel to the rule's removal. */
 
 #include "cmap.h"
-#include "match.h"
-#include "meta-flow.h"
+#include "openvswitch/match.h"
+#include "openvswitch/meta-flow.h"
 #include "pvector.h"
 #include "rculist.h"
-#include "type-props.h"
+#include "openvswitch/type-props.h"
+#include "versions.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -321,12 +322,6 @@ struct cls_trie {
     const struct mf_field *field; /* Trie field, or NULL. */
     rcu_trie_ptr root;            /* NULL if none. */
 };
-
-typedef uint64_t cls_version_t;
-
-#define CLS_MIN_VERSION 0                  /* Default version number to use. */
-#define CLS_MAX_VERSION (TYPE_MAXIMUM(cls_version_t) - 1)
-#define CLS_NOT_REMOVED_VERSION TYPE_MAXIMUM(cls_version_t)
 
 enum {
     CLS_MAX_INDICES = 3,   /* Maximum number of lookup indices per subtable. */
@@ -357,9 +352,19 @@ struct cls_conjunction {
 struct cls_rule {
     struct rculist node;          /* In struct cls_subtable 'rules_list'. */
     const int priority;           /* Larger numbers are higher priorities. */
-    struct cls_match *cls_match;  /* NULL if not in a classifier. */
+    OVSRCU_TYPE(struct cls_match *) cls_match;  /* NULL if not in a
+                                                 * classifier. */
     const struct minimatch match; /* Matching rule. */
 };
+
+/* Constructor/destructor.  Must run single-threaded. */
+void classifier_init(struct classifier *, const uint8_t *flow_segments);
+void classifier_destroy(struct classifier *);
+
+/* Modifiers.  Caller MUST exclude concurrent calls from other threads. */
+bool classifier_set_prefix_fields(struct classifier *,
+                                  const enum mf_field_id *trie_fields,
+                                  unsigned int n_trie_fields);
 
 void cls_rule_init(struct cls_rule *, const struct match *, int priority);
 void cls_rule_init_from_minimatch(struct cls_rule *, const struct minimatch *,
@@ -370,55 +375,53 @@ void cls_rule_destroy(struct cls_rule *);
 
 void cls_rule_set_conjunctions(struct cls_rule *,
                                const struct cls_conjunction *, size_t n);
-
-bool cls_rule_equal(const struct cls_rule *, const struct cls_rule *);
-uint32_t cls_rule_hash(const struct cls_rule *, uint32_t basis);
-void cls_rule_format(const struct cls_rule *, struct ds *);
-bool cls_rule_is_catchall(const struct cls_rule *);
-bool cls_rule_is_loose_match(const struct cls_rule *rule,
-                             const struct minimatch *criteria);
-bool cls_rule_visible_in_version(const struct cls_rule *, cls_version_t);
 void cls_rule_make_invisible_in_version(const struct cls_rule *,
-                                        cls_version_t);
+                                        ovs_version_t);
 void cls_rule_restore_visibility(const struct cls_rule *);
 
-/* Constructor/destructor.  Must run single-threaded. */
-void classifier_init(struct classifier *, const uint8_t *flow_segments);
-void classifier_destroy(struct classifier *);
-
-/* Modifiers.  Caller MUST exclude concurrent calls from other threads. */
-bool classifier_set_prefix_fields(struct classifier *,
-                                  const enum mf_field_id *trie_fields,
-                                  unsigned int n_trie_fields);
 void classifier_insert(struct classifier *, const struct cls_rule *,
-                       cls_version_t, const struct cls_conjunction *,
+                       ovs_version_t, const struct cls_conjunction *,
                        size_t n_conjunctions);
 const struct cls_rule *classifier_replace(struct classifier *,
                                           const struct cls_rule *,
-                                          cls_version_t,
+                                          ovs_version_t,
                                           const struct cls_conjunction *,
                                           size_t n_conjunctions);
-const struct cls_rule *classifier_remove(struct classifier *,
-                                         const struct cls_rule *);
+bool classifier_remove(struct classifier *, const struct cls_rule *);
+void classifier_remove_assert(struct classifier *, const struct cls_rule *);
 static inline void classifier_defer(struct classifier *);
 static inline void classifier_publish(struct classifier *);
 
 /* Lookups.  These are RCU protected and may run concurrently with modifiers
  * and each other. */
 const struct cls_rule *classifier_lookup(const struct classifier *,
-                                         cls_version_t, struct flow *,
+                                         ovs_version_t, struct flow *,
                                          struct flow_wildcards *);
 bool classifier_rule_overlaps(const struct classifier *,
-                              const struct cls_rule *, cls_version_t);
+                              const struct cls_rule *, ovs_version_t);
 const struct cls_rule *classifier_find_rule_exactly(const struct classifier *,
                                                     const struct cls_rule *,
-                                                    cls_version_t);
+                                                    ovs_version_t);
 const struct cls_rule *classifier_find_match_exactly(const struct classifier *,
                                                      const struct match *,
                                                      int priority,
-                                                     cls_version_t);
+                                                     ovs_version_t);
+const struct cls_rule *classifier_find_minimatch_exactly(
+    const struct classifier *, const struct minimatch *,
+    int priority, ovs_version_t);
+
 bool classifier_is_empty(const struct classifier *);
 int classifier_count(const struct classifier *);
+
+/* Classifier rule properties.  These are RCU protected and may run
+ * concurrently with modifiers and each other. */
+bool cls_rule_equal(const struct cls_rule *, const struct cls_rule *);
+void cls_rule_format(const struct cls_rule *, const struct tun_table *,
+                     const struct ofputil_port_map *, struct ds *);
+bool cls_rule_is_catchall(const struct cls_rule *);
+bool cls_rule_is_loose_match(const struct cls_rule *rule,
+                             const struct minimatch *criteria);
+bool cls_rule_visible_in_version(const struct cls_rule *, ovs_version_t);
 
 /* Iteration.
  *
@@ -436,18 +439,18 @@ struct cls_cursor {
     const struct classifier *cls;
     const struct cls_subtable *subtable;
     const struct cls_rule *target;
-    cls_version_t version;   /* Version to iterate. */
+    ovs_version_t version;   /* Version to iterate. */
     struct pvector_cursor subtables;
     const struct cls_rule *rule;
 };
 
 struct cls_cursor cls_cursor_start(const struct classifier *,
                                    const struct cls_rule *target,
-                                   cls_version_t);
+                                   ovs_version_t);
 void cls_cursor_advance(struct cls_cursor *);
 
 #define CLS_FOR_EACH(RULE, MEMBER, CLS)             \
-    CLS_FOR_EACH_TARGET(RULE, MEMBER, CLS, NULL, CLS_MAX_VERSION)
+    CLS_FOR_EACH_TARGET(RULE, MEMBER, CLS, NULL, OVS_VERSION_MAX)
 #define CLS_FOR_EACH_TARGET(RULE, MEMBER, CLS, TARGET, VERSION)         \
     for (struct cls_cursor cursor__ = cls_cursor_start(CLS, TARGET, VERSION); \
          (cursor__.rule                                                 \

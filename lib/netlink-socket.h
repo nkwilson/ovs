@@ -193,7 +193,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
 #include "ovs-atomic.h"
 #include "ovs-thread.h"
 
@@ -213,6 +213,8 @@ void nl_sock_destroy(struct nl_sock *);
 int nl_sock_join_mcgroup(struct nl_sock *, unsigned int multicast_group);
 int nl_sock_leave_mcgroup(struct nl_sock *, unsigned int multicast_group);
 
+int nl_sock_listen_all_nsid(struct nl_sock *, bool enable);
+
 #ifdef _WIN32
 int nl_sock_subscribe_packets(struct nl_sock *sock);
 int nl_sock_unsubscribe_packets(struct nl_sock *sock);
@@ -221,12 +223,14 @@ int nl_sock_unsubscribe_packets(struct nl_sock *sock);
 int nl_sock_send(struct nl_sock *, const struct ofpbuf *, bool wait);
 int nl_sock_send_seq(struct nl_sock *, const struct ofpbuf *,
                      uint32_t nlmsg_seq, bool wait);
-int nl_sock_recv(struct nl_sock *, struct ofpbuf *, bool wait);
+int nl_sock_recv(struct nl_sock *, struct ofpbuf *, int *nsid, bool wait);
 
 int nl_sock_drain(struct nl_sock *);
 
 void nl_sock_wait(const struct nl_sock *, short int events);
+#ifndef _WIN32
 int nl_sock_fd(const struct nl_sock *);
+#endif
 
 uint32_t nl_sock_pid(const struct nl_sock *);
 
@@ -258,12 +262,12 @@ struct nl_dump {
     /* These members are immutable during the lifetime of the nl_dump. */
     struct nl_sock *sock;       /* Socket being dumped. */
     uint32_t nl_seq;            /* Expected nlmsg_seq for replies. */
-
-    /* 'mutex' protects 'status' and serializes access to 'sock'. */
-    struct ovs_mutex mutex;     /* Protects 'status', synchronizes recv(). */
     int status OVS_GUARDED;     /* 0: dump in progress,
                                  * positive errno: dump completed with error,
                                  * EOF: dump completed successfully. */
+
+    /* 'mutex' protects 'status' and serializes access to 'sock'. */
+    struct ovs_mutex mutex;     /* Protects 'status', synchronizes recv(). */
 };
 
 void nl_dump_start(struct nl_dump *, int protocol,

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 VMware, Inc.
+ * Copyright (c) 2014, 2016 VMware, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,10 +24,10 @@
 #include "coverage.h"
 #include "fatal-signal.h"
 #include "netdev-provider.h"
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
 #include "packets.h"
-#include "poll-loop.h"
-#include "shash.h"
+#include "openvswitch/poll-loop.h"
+#include "openvswitch/shash.h"
 #include "svec.h"
 #include "openvswitch/vlog.h"
 #include "odp-netlink.h"
@@ -53,7 +53,7 @@ struct netdev_windows {
 
     unsigned int cache_valid;
     int ifindex;
-    uint8_t mac[ETH_ADDR_LEN];
+    struct eth_addr mac;
     uint32_t mtu;
     unsigned int ifi_flags;
 };
@@ -70,7 +70,7 @@ struct netdev_windows_netdev_info {
 
     /* General information of a network device. */
     const char *name;
-    uint8_t mac_address[ETH_ADDR_LEN];
+    struct eth_addr mac_address;
     uint32_t mtu;
     uint32_t ifi_flags;
 };
@@ -138,11 +138,11 @@ dp_to_netdev_ifi_flags(uint32_t dp_flags)
 {
     uint32_t nd_flags = 0;
 
-    if (dp_flags && OVS_WIN_NETDEV_IFF_UP) {
+    if (dp_flags & OVS_WIN_NETDEV_IFF_UP) {
         nd_flags |= NETDEV_UP;
     }
 
-    if (dp_flags && OVS_WIN_NETDEV_IFF_PROMISC) {
+    if (dp_flags & OVS_WIN_NETDEV_IFF_PROMISC) {
         nd_flags |= NETDEV_PROMISC;
     }
 
@@ -153,14 +153,16 @@ static int
 netdev_windows_system_construct(struct netdev *netdev_)
 {
     struct netdev_windows *netdev = netdev_windows_cast(netdev_);
-    uint8_t mac[ETH_ADDR_LEN];
     struct netdev_windows_netdev_info info;
     struct ofpbuf *buf;
     int ret;
 
     /* Query the attributes and runtime status of the netdev. */
     ret = query_netdev(netdev_get_name(&netdev->up), &info, &buf);
-    if (ret) {
+    /* "Internal" netdevs do not exist in the kernel yet.  They need to be
+     * transformed into a netdev object and passed to dpif_port_add(), which
+     * will add them to the kernel.  */
+    if (strcmp(netdev_get_type(&netdev->up), "internal") && ret) {
         return ret;
     }
     ofpbuf_delete(buf);
@@ -169,7 +171,7 @@ netdev_windows_system_construct(struct netdev *netdev_)
     netdev->dev_type = info.ovs_type;
     netdev->port_no = info.port_no;
 
-    memcpy(netdev->mac, info.mac_address, ETH_ADDR_LEN);
+    netdev->mac = info.mac_address;
     netdev->cache_valid = VALID_ETHERADDR;
     netdev->ifindex = -EOPNOTSUPP;
 
@@ -225,18 +227,14 @@ netdev_windows_netdev_from_ofpbuf(struct netdev_windows_netdev_info *info,
         [OVS_WIN_NETDEV_ATTR_IF_FLAGS] = { .type = NL_A_U32 },
     };
 
-    struct nlattr *a[ARRAY_SIZE(ovs_netdev_policy)];
-    struct ovs_header *ovs_header;
-    struct nlmsghdr *nlmsg;
-    struct genlmsghdr *genl;
-    struct ofpbuf b;
-
     netdev_windows_info_init(info);
 
-    ofpbuf_use_const(&b, buf->data, buf->size);
-    nlmsg = ofpbuf_try_pull(&b, sizeof *nlmsg);
-    genl = ofpbuf_try_pull(&b, sizeof *genl);
-    ovs_header = ofpbuf_try_pull(&b, sizeof *ovs_header);
+    struct ofpbuf b = ofpbuf_const_initializer(buf->data, buf->size);
+    struct nlmsghdr *nlmsg = ofpbuf_try_pull(&b, sizeof *nlmsg);
+    struct genlmsghdr *genl = ofpbuf_try_pull(&b, sizeof *genl);
+    struct ovs_header *ovs_header = ofpbuf_try_pull(&b, sizeof *ovs_header);
+
+    struct nlattr *a[ARRAY_SIZE(ovs_netdev_policy)];
     if (!nlmsg || !genl || !ovs_header
         || nlmsg->nlmsg_type != ovs_win_netdev_family
         || !nl_policy_parse(&b, 0, ovs_netdev_policy, a,
@@ -249,7 +247,7 @@ netdev_windows_netdev_from_ofpbuf(struct netdev_windows_netdev_info *info,
     info->port_no = nl_attr_get_odp_port(a[OVS_WIN_NETDEV_ATTR_PORT_NO]);
     info->ovs_type = nl_attr_get_u32(a[OVS_WIN_NETDEV_ATTR_TYPE]);
     info->name = nl_attr_get_string(a[OVS_WIN_NETDEV_ATTR_NAME]);
-    memcpy(info->mac_address, nl_attr_get_unspec(a[OVS_WIN_NETDEV_ATTR_MAC_ADDR],
+    memcpy(&info->mac_address, nl_attr_get_unspec(a[OVS_WIN_NETDEV_ATTR_MAC_ADDR],
                sizeof(info->mac_address)), sizeof(info->mac_address));
     info->mtu = nl_attr_get_u32(a[OVS_WIN_NETDEV_ATTR_MTU]);
     info->ifi_flags = nl_attr_get_u32(a[OVS_WIN_NETDEV_ATTR_IF_FLAGS]);
@@ -300,7 +298,7 @@ query_netdev(const char *devname,
         }
     }
 
-    return 0;
+    return error;
 }
 
 static void
@@ -318,13 +316,13 @@ netdev_windows_dealloc(struct netdev *netdev_)
 
 static int
 netdev_windows_get_etheraddr(const struct netdev *netdev_,
-                             uint8_t mac[ETH_ADDR_LEN])
+                             struct eth_addr *mac)
 {
     struct netdev_windows *netdev = netdev_windows_cast(netdev_);
 
     ovs_assert((netdev->cache_valid & VALID_ETHERADDR) != 0);
     if (netdev->cache_valid & VALID_ETHERADDR) {
-        memcpy(mac, netdev->mac, ETH_ADDR_LEN);
+        *mac = netdev->mac;
     } else {
         return EINVAL;
     }
@@ -349,7 +347,7 @@ netdev_windows_get_mtu(const struct netdev *netdev_, int *mtup)
  * But vswitchd bringup expects this to be implemented. */
 static int
 netdev_windows_set_etheraddr(const struct netdev *netdev_,
-                             uint8_t mac[ETH_ADDR_LEN])
+                             const struct eth_addr mac)
 {
     return 0;
 }
@@ -380,7 +378,7 @@ netdev_windows_update_flags(struct netdev *netdev_,
  */
 static int
 netdev_windows_arp_lookup(const struct netdev *netdev,
-                          ovs_be32 ip, uint8_t mac[ETH_ADDR_LEN])
+                          ovs_be32 ip, struct eth_addr *mac)
 {
     PMIB_IPNETTABLE arp_table = NULL;
     /* The buffer length of all ARP entries */
@@ -396,12 +394,7 @@ netdev_windows_arp_lookup(const struct netdev *netdev,
         return ENXIO;
     }
 
-    arp_table = (MIB_IPNETTABLE *) malloc(buffer_length);
-
-    if (arp_table == NULL) {
-        VLOG_ERR("Could not allocate memory for all the interfaces");
-        return ENXIO;
-    }
+    arp_table = (MIB_IPNETTABLE *) xmalloc(buffer_length);
 
     ret_val = GetIpNetTable(arp_table, &buffer_length, false);
 
@@ -430,27 +423,22 @@ netdev_windows_get_next_hop(const struct in_addr *host,
 {
     uint32_t ret_val = 0;
     /* The buffer length of all addresses */
-    uint32_t buffer_length = 1000;
+    uint32_t buffer_length = 0;
     PIP_ADAPTER_ADDRESSES all_addr = NULL;
     PIP_ADAPTER_ADDRESSES cur_addr = NULL;
 
     ret_val = GetAdaptersAddresses(AF_INET,
                                    GAA_FLAG_INCLUDE_PREFIX |
                                    GAA_FLAG_INCLUDE_GATEWAYS,
-                                   NULL, all_addr, &buffer_length);
+                                   NULL, NULL, &buffer_length);
 
-    if (ret_val != ERROR_INSUFFICIENT_BUFFER ) {
+    if (ret_val != ERROR_BUFFER_OVERFLOW ) {
         VLOG_ERR("Call to GetAdaptersAddresses failed with error: %s",
                  ovs_format_message(ret_val));
         return ENXIO;
     }
 
-    all_addr = (IP_ADAPTER_ADDRESSES *) malloc(buffer_length);
-
-    if (all_addr == NULL) {
-        VLOG_ERR("Could not allocate memory for all the interfaces");
-        return ENXIO;
-    }
+    all_addr = (IP_ADAPTER_ADDRESSES *) xmalloc(buffer_length);
 
     ret_val = GetAdaptersAddresses(AF_INET,
                                    GAA_FLAG_INCLUDE_PREFIX |
@@ -495,6 +483,7 @@ netdev_windows_internal_construct(struct netdev *netdev_)
 #define NETDEV_WINDOWS_CLASS(NAME, CONSTRUCT)                           \
 {                                                                       \
     .type               = NAME,                                         \
+    .is_pmd             = false,                                        \
     .alloc              = netdev_windows_alloc,                         \
     .construct          = CONSTRUCT,                                    \
     .destruct           = netdev_windows_destruct,                      \

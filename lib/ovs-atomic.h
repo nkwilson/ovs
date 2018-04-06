@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2013, 2014, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,6 +69,8 @@
  *     int8_t                   atomic_int8_t      (*)
  *     int16_t                  atomic_int16_t     (*)
  *     int32_t                  atomic_int32_t     (*)
+ *     uint64_t                 atomic_uint64_t    (*)
+ *     int64_t                  atomic_int64_t     (*)
  *
  *     (*) Not specified by C11.
  *
@@ -121,7 +123,7 @@
  *        operation (atomic_read_explicit, or a load operation preceding a
  *        atomic_thread_fence) will not be moved prior to the consume
  *        barrier.  Non-data-dependent loads and stores can be reordered to
- *        happen before the the consume barrier.
+ *        happen before the consume barrier.
  *
  *        RCU is the prime example of the use of the consume barrier: The
  *        consume barrier guarantees that reads from a RCU protected object
@@ -298,7 +300,7 @@
  *     bool atomic_flag_test_and_set_explicit(atomic_flag *object,
  *                                            memory_order);
  *
- *         Atomically sets '*object', respsecting the given memory order (or
+ *         Atomically sets '*object', respecting the given memory order (or
  *         memory_order_seq_cst for atomic_flag_test_and_set()).  Returns the
  *         previous value of the flag (false for clear, true for set).
  *
@@ -323,9 +325,13 @@
         #include "ovs-atomic-pthreads.h"
     #elif __has_extension(c_atomic)
         #include "ovs-atomic-clang.h"
-    #elif HAVE_STDATOMIC_H
+    #elif HAVE_ATOMIC && __cplusplus >= 201103L
+        #include "ovs-atomic-c++.h"
+    #elif HAVE_STDATOMIC_H && !defined(__cplusplus)
         #include "ovs-atomic-c11.h"
-    #elif __GNUC__ >= 4 && __GNUC_MINOR__ >= 7
+    #elif __GNUC__ >= 5 && !defined(__cplusplus)
+        #error "GCC 5+ should have <stdatomic.h>"
+    #elif __GNUC__ >= 5 || (__GNUC__ >= 4 && __GNUC_MINOR__ >= 7)
         #include "ovs-atomic-gcc4.7+.h"
     #elif __GNUC__ && defined(__x86_64__)
         #include "ovs-atomic-x86_64.h"
@@ -333,7 +339,7 @@
         #include "ovs-atomic-i586.h"
     #elif HAVE_GCC4_ATOMICS
         #include "ovs-atomic-gcc4+.h"
-    #elif _MSC_VER && _M_IX86 >= 500
+    #elif _MSC_VER
         #include "ovs-atomic-msvc.h"
     #else
         /* ovs-atomic-pthreads implementation is provided for portability.
@@ -376,10 +382,12 @@ typedef ATOMIC(uintptr_t)          atomic_uintptr_t;
 typedef ATOMIC(uint8_t)   atomic_uint8_t;
 typedef ATOMIC(uint16_t)  atomic_uint16_t;
 typedef ATOMIC(uint32_t)  atomic_uint32_t;
+typedef ATOMIC(uint64_t)  atomic_uint64_t;
 
 typedef ATOMIC(int8_t)    atomic_int8_t;
 typedef ATOMIC(int16_t)   atomic_int16_t;
 typedef ATOMIC(int32_t)   atomic_int32_t;
+typedef ATOMIC(int64_t)   atomic_int64_t;
 
 /* Relaxed atomic operations.
  *
@@ -440,7 +448,7 @@ atomic_count_inc(atomic_count *count)
 {
     unsigned int old;
 
-    atomic_add_relaxed(&count->count, 1, &old);
+    atomic_add_relaxed(&count->count, 1u, &old);
 
     return old;
 }
@@ -450,7 +458,7 @@ atomic_count_dec(atomic_count *count)
 {
     unsigned int old;
 
-    atomic_sub_relaxed(&count->count, 1, &old);
+    atomic_sub_relaxed(&count->count, 1u, &old);
 
     return old;
 }
@@ -480,7 +488,7 @@ struct ovs_refcount {
 static inline void
 ovs_refcount_init(struct ovs_refcount *refcount)
 {
-    atomic_init(&refcount->count, 1);
+    atomic_init(&refcount->count, 1u);
 }
 
 /* Increments 'refcount'.
@@ -492,7 +500,7 @@ ovs_refcount_ref(struct ovs_refcount *refcount)
 {
     unsigned int old_refcount;
 
-    atomic_add_explicit(&refcount->count, 1, &old_refcount,
+    atomic_add_explicit(&refcount->count, 1u, &old_refcount,
                         memory_order_relaxed);
     ovs_assert(old_refcount > 0);
 }
@@ -515,7 +523,7 @@ ovs_refcount_unref(struct ovs_refcount *refcount)
 {
     unsigned int old_refcount;
 
-    atomic_sub_explicit(&refcount->count, 1, &old_refcount,
+    atomic_sub_explicit(&refcount->count, 1u, &old_refcount,
                         memory_order_release);
     ovs_assert(old_refcount > 0);
     if (old_refcount == 1) {
@@ -596,7 +604,7 @@ ovs_refcount_try_ref_rcu(struct ovs_refcount *refcount)
  *
  * if (stp && ovs_refcount_unref_relaxed(&stp->ref_cnt) == 1) {
  *     ovs_mutex_lock(&mutex);
- *     list_remove(&stp->node);
+ *     ovs_list_remove(&stp->node);
  *     ovs_mutex_unlock(&mutex);
  *     free(stp->name);
  *     free(stp);
@@ -613,7 +621,7 @@ ovs_refcount_unref_relaxed(struct ovs_refcount *refcount)
 {
     unsigned int old_refcount;
 
-    atomic_sub_explicit(&refcount->count, 1, &old_refcount,
+    atomic_sub_explicit(&refcount->count, 1u, &old_refcount,
                         memory_order_relaxed);
     ovs_assert(old_refcount > 0);
     return old_refcount;

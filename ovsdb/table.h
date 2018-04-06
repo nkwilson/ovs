@@ -18,8 +18,8 @@
 
 #include <stdbool.h>
 #include "compiler.h"
-#include "hmap.h"
-#include "shash.h"
+#include "openvswitch/hmap.h"
+#include "openvswitch/shash.h"
 
 struct json;
 struct uuid;
@@ -28,9 +28,9 @@ struct uuid;
 struct ovsdb_table_schema {
     char *name;
     bool mutable;
-    struct shash columns;       /* Contains "struct ovsdb_column *"s. */
-    unsigned int max_rows;      /* Maximum number of rows. */
     bool is_root;               /* Part of garbage collection root set? */
+    unsigned int max_rows;      /* Maximum number of rows. */
+    struct shash columns;       /* Contains "struct ovsdb_column *"s. */
     struct ovsdb_column_set *indexes;
     size_t n_indexes;
 };

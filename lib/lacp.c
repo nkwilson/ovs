@@ -19,19 +19,20 @@
 #include <stdlib.h>
 
 #include "connectivity.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "hash.h"
-#include "hmap.h"
+#include "openvswitch/hmap.h"
 #include "dp-packet.h"
 #include "ovs-atomic.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "seq.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
 #include "timer.h"
 #include "timeval.h"
 #include "unixctl.h"
 #include "openvswitch/vlog.h"
+#include "util.h"
 
 VLOG_DEFINE_THIS_MODULE(lacp);
 
@@ -53,7 +54,7 @@ VLOG_DEFINE_THIS_MODULE(lacp);
 OVS_PACKED(
 struct lacp_info {
     ovs_be16 sys_priority;            /* System priority. */
-    uint8_t sys_id[ETH_ADDR_LEN];     /* System ID. */
+    struct eth_addr sys_id;           /* System ID. */
     ovs_be16 key;                     /* Operational key. */
     ovs_be16 port_priority;           /* Port priority. */
     ovs_be16 port_id;                 /* Port ID. */
@@ -94,7 +95,7 @@ enum slave_status {
 struct lacp {
     struct ovs_list node;         /* Node in all_lacps list. */
     char *name;                   /* Name of this lacp object. */
-    uint8_t sys_id[ETH_ADDR_LEN]; /* System ID. */
+    struct eth_addr sys_id;       /* System ID. */
     uint16_t sys_priority;        /* System Priority. */
     bool active;                  /* Active or Passive. */
 
@@ -236,7 +237,7 @@ lacp_create(void) OVS_EXCLUDED(mutex)
     ovs_refcount_init(&lacp->ref_cnt);
 
     lacp_lock();
-    list_push_back(all_lacps, &lacp->node);
+    ovs_list_push_back(all_lacps, &lacp->node);
     lacp_unlock();
     return lacp;
 }
@@ -264,7 +265,7 @@ lacp_unref(struct lacp *lacp) OVS_EXCLUDED(mutex)
         }
 
         hmap_destroy(&lacp->slaves);
-        list_remove(&lacp->node);
+        ovs_list_remove(&lacp->node);
         free(lacp->name);
         free(lacp);
         lacp_unlock();
@@ -286,7 +287,7 @@ lacp_configure(struct lacp *lacp, const struct lacp_settings *s)
 
     if (!eth_addr_equals(lacp->sys_id, s->id)
         || lacp->sys_priority != s->priority) {
-        memcpy(lacp->sys_id, s->id, ETH_ADDR_LEN);
+        lacp->sys_id = s->id;
         lacp->sys_priority = s->priority;
         lacp->update = true;
     }
@@ -336,7 +337,7 @@ lacp_process_packet(struct lacp *lacp, const void *slave_,
 
     pdu = parse_lacp_packet(packet);
     if (!pdu) {
-	slave->count_rx_pdus_bad++;
+        slave->count_rx_pdus_bad++;
         VLOG_WARN_RL(&rl, "%s: received an unparsable LACP PDU.", lacp->name);
         goto out;
     }
@@ -535,6 +536,7 @@ lacp_run(struct lacp *lacp, lacp_send_pdu *send_pdu) OVS_EXCLUDED(mutex)
 
     if (lacp->update) {
         lacp_update_attached(lacp);
+        seq_change(connectivity_seq_get());
     }
 
     HMAP_FOR_EACH (slave, node, &lacp->slaves) {
@@ -554,7 +556,7 @@ lacp_run(struct lacp *lacp, lacp_send_pdu *send_pdu) OVS_EXCLUDED(mutex)
             slave->ntt_actor = actor;
             compose_lacp_pdu(&actor, &slave->partner, &pdu);
             send_pdu(slave->aux, &pdu, sizeof pdu);
-	    slave->count_tx_pdus++;
+            slave->count_tx_pdus++;
 
             duration = (slave->partner.state & LACP_STATE_TIME
                         ? LACP_FAST_TIME_TX
@@ -593,13 +595,33 @@ lacp_wait(struct lacp *lacp) OVS_EXCLUDED(mutex)
 static void
 lacp_update_attached(struct lacp *lacp) OVS_REQUIRES(mutex)
 {
-    struct slave *lead, *slave;
+    struct slave *lead, *lead_current, *slave;
     struct lacp_info lead_pri;
+    bool lead_enable;
     static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 10);
 
     lacp->update = false;
 
     lead = NULL;
+    lead_current = NULL;
+    lead_enable = false;
+
+    /* Check if there is a working interface.
+     * Store as lead_current, if there is one. */
+    HMAP_FOR_EACH (slave, node, &lacp->slaves) {
+        if (slave->status == LACP_CURRENT && slave->attached) {
+            struct lacp_info pri;
+            slave_get_priority(slave, &pri);
+            if (!lead_current || memcmp(&pri, &lead_pri, sizeof pri) < 0) {
+                lead_current = slave;
+                lead = lead_current;
+                lead_pri = pri;
+                lead_enable = true;
+            }
+        }
+    }
+
+    /* Find interface with highest priority. */
     HMAP_FOR_EACH (slave, node, &lacp->slaves) {
         struct lacp_info pri;
 
@@ -620,11 +642,24 @@ lacp_update_attached(struct lacp *lacp) OVS_REQUIRES(mutex)
             continue;
         }
 
-        slave->attached = true;
         slave_get_priority(slave, &pri);
+        bool enable = slave_may_enable__(slave);
 
-        if (!lead || memcmp(&pri, &lead_pri, sizeof pri) < 0) {
+        /* Check if partner MAC address is the same as on the working
+         * interface. Activate slave only if the MAC is the same, or
+         * there is no working interface. */
+        if (!lead_current || (lead_current
+            && eth_addr_equals(slave->partner.sys_id,
+                               lead_current->partner.sys_id))) {
+            slave->attached = true;
+        }
+        if (slave->attached &&
+                (!lead
+                 || enable > lead_enable
+                 || (enable == lead_enable
+                     && memcmp(&pri, &lead_pri, sizeof pri) < 0))) {
             lead = slave;
+            lead_enable = enable;
             lead_pri = pri;
         }
     }
@@ -732,7 +767,7 @@ slave_get_actor(struct slave *slave, struct lacp_info *actor)
     actor->port_priority = htons(slave->port_priority);
     actor->port_id = htons(slave->port_id);
     actor->sys_priority = htons(lacp->sys_priority);
-    memcpy(&actor->sys_id, lacp->sys_id, ETH_ADDR_LEN);
+    actor->sys_id = lacp->sys_id;
 }
 
 /* Given 'slave', populates 'priority' with data representing its LACP link
@@ -1002,12 +1037,8 @@ lacp_get_slave_stats(const struct lacp *lacp, const void *slave_, struct lacp_sl
     if (slave) {
 	ret = true;
 	slave_get_actor(slave, &actor);
-	memcpy(&stats->dot3adAggPortActorSystemID,
-	       actor.sys_id,
-	       ETH_ADDR_LEN);
-	memcpy(&stats->dot3adAggPortPartnerOperSystemID,
-	       slave->partner.sys_id,
-	       ETH_ADDR_LEN);
+	stats->dot3adAggPortActorSystemID = actor.sys_id;
+	stats->dot3adAggPortPartnerOperSystemID = slave->partner.sys_id;
 	stats->dot3adAggPortAttachedAggID = (lacp->key_slave->key ?
 					     lacp->key_slave->key :
 					     lacp->key_slave->port_id);

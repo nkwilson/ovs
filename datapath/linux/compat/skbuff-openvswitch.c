@@ -2,6 +2,7 @@
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <linux/if_vlan.h>
+#include <linux/kconfig.h>
 
 #include "gso.h"
 
@@ -22,11 +23,7 @@ void __skb_warn_lro_forwarding(const struct sk_buff *skb)
 
 static inline bool head_frag(const struct sk_buff *skb)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
 	return skb->head_frag;
-#else
-	return false;
-#endif
 }
 
  /**
@@ -144,9 +141,9 @@ int rpl_skb_ensure_writable(struct sk_buff *skb, int write_len)
 EXPORT_SYMBOL_GPL(rpl_skb_ensure_writable);
 #endif
 
-#ifndef HAVE_SKB_VLAN_POP
+#if !defined(HAVE___SKB_VLAN_POP) || !defined(HAVE_SKB_VLAN_POP)
 /* remove VLAN header from packet and update csum accordingly. */
-static int __skb_vlan_pop(struct sk_buff *skb, u16 *vlan_tci)
+int rpl___skb_vlan_pop(struct sk_buff *skb, u16 *vlan_tci)
 {
 	struct vlan_hdr *vhdr;
 	unsigned int offset = skb->data - skb_mac_header(skb);
@@ -177,7 +174,9 @@ pull:
 
 	return err;
 }
+#endif
 
+#ifndef HAVE_SKB_VLAN_POP
 int rpl_skb_vlan_pop(struct sk_buff *skb)
 {
 	u16 vlan_tci;
@@ -192,7 +191,7 @@ int rpl_skb_vlan_pop(struct sk_buff *skb)
 			     skb->len < VLAN_ETH_HLEN))
 			return 0;
 
-		err = __skb_vlan_pop(skb, &vlan_tci);
+		err = rpl___skb_vlan_pop(skb, &vlan_tci);
 		if (err)
 			return err;
 	}
@@ -251,7 +250,7 @@ int rpl_pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
 
 	inner_mac_offset = skb_inner_mac_offset(skb);
 	inner_nw_offset = skb_inner_network_offset(skb);
-	inner_transport_offset = ovs_skb_inner_transport_offset(skb);
+	inner_transport_offset = skb_inner_transport_offset(skb);
 
 #undef pskb_expand_head
 	err = pskb_expand_head(skb, nhead, ntail, gfp_mask);
@@ -279,4 +278,33 @@ void rpl_kfree_skb_list(struct sk_buff *segs)
 	}
 }
 EXPORT_SYMBOL(rpl_kfree_skb_list);
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0)
+
+#define nf_reset_trace rpl_nf_reset_trace
+static void nf_reset_trace(struct sk_buff *skb)
+{
+#if IS_ENABLED(CONFIG_NETFILTER_XT_TARGET_TRACE) || defined(CONFIG_NF_TABLES)
+	skb->nf_trace = 0;
+#endif
+}
+
+void rpl_skb_scrub_packet(struct sk_buff *skb, bool xnet)
+{
+	skb->tstamp.tv64 = 0;
+	skb->pkt_type = PACKET_HOST;
+	skb->skb_iif = 0;
+	skb->ignore_df = 0;
+	skb_dst_drop(skb);
+	secpath_reset(skb);
+	nf_reset(skb);
+	nf_reset_trace(skb);
+
+	if (!xnet)
+		return;
+
+	skb_orphan(skb);
+	skb->mark = 0;
+}
 #endif

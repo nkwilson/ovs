@@ -1,4 +1,4 @@
-/* Copyright (c) 2015 Nicira, Inc.
+/* Copyright (c) 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,13 +20,36 @@
  * ============================
  *
  * This module implements physical-to-logical and logical-to-physical
- * translation as separate OpenFlow tables that run before and after,
- * respectively, the logical pipeline OpenFlow tables.
+ * translation as separate OpenFlow tables that run before the ingress pipeline
+ * and after the egress pipeline, respectively, as well as to connect the
+ * two pipelines.
  */
 
-struct controller_ctx;
+#include "openvswitch/meta-flow.h"
 
-void physical_init(struct controller_ctx *);
-void physical_run(struct controller_ctx *);
+struct controller_ctx;
+struct hmap;
+struct ovsdb_idl;
+struct ovsrec_bridge;
+struct simap;
+struct sset;
+struct chassis_index;
+
+/* OVN Geneve option information.
+ *
+ * Keep these in sync with the documentation in ovn-architecture(7). */
+#define OVN_GENEVE_CLASS 0x0102  /* Assigned Geneve class for OVN. */
+#define OVN_GENEVE_TYPE 0x80     /* Critical option. */
+#define OVN_GENEVE_LEN 4
+
+void physical_register_ovs_idl(struct ovsdb_idl *);
+void physical_run(struct controller_ctx *, enum mf_field_id mff_ovn_geneve,
+                  const struct ovsrec_bridge *br_int,
+                  const struct sbrec_chassis *chassis,
+                  const struct simap *ct_zones,
+                  struct hmap *flow_table, struct hmap *local_datapaths,
+                  const struct sset *local_lports,
+                  struct chassis_index *chassis_index,
+                  struct sset *active_tunnels);
 
 #endif /* ovn/physical.h */

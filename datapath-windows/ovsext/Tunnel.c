@@ -39,22 +39,13 @@
 #include "PacketIO.h"
 #include "NetProto.h"
 #include "Flow.h"
+#include "Actions.h"
 
 extern POVS_SWITCH_CONTEXT gOvsSwitchContext;
 
 static NTSTATUS
 OvsInjectPacketThroughActions(PNET_BUFFER_LIST pNbl,
                               OVS_TUNNEL_PENDED_PACKET *packet);
-
-VOID OvsAcquireDatapathRead(OVS_DATAPATH *datapath,
-                            LOCK_STATE_EX *lockState,
-                            BOOLEAN dispatch);
-VOID OvsAcquireDatapathWrite(OVS_DATAPATH *datapath,
-                             LOCK_STATE_EX *lockState,
-                             BOOLEAN dispatch);
-VOID OvsReleaseDatapath(OVS_DATAPATH *datapath,
-                        LOCK_STATE_EX *lockState);
-
 
 NTSTATUS
 OvsTunnelNotify(FWPS_CALLOUT_NOTIFY_TYPE notifyType,
@@ -213,7 +204,7 @@ static NTSTATUS
 OvsInjectPacketThroughActions(PNET_BUFFER_LIST pNbl,
                               OVS_TUNNEL_PENDED_PACKET *packet)
 {
-    NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status;
     OvsIPv4TunnelKey tunnelKey;
     NET_BUFFER *pNb;
     ULONG sendCompleteFlags = 0;
@@ -224,10 +215,9 @@ OvsInjectPacketThroughActions(PNET_BUFFER_LIST pNbl,
     OvsCompletionList completionList;
     KIRQL irql;
     ULONG SendFlags = NDIS_SEND_FLAGS_SWITCH_DESTINATION_GROUP;
-    OVS_DATAPATH *datapath = NULL;
+    OVS_DATAPATH *datapath = &gOvsSwitchContext->datapath;
 
     ASSERT(gOvsSwitchContext);
-    datapath = &gOvsSwitchContext->datapath;
 
     /* Fill the tunnel key */
     status = OvsSlowPathDecapVxlan(pNbl, &tunnelKey);
@@ -258,13 +248,13 @@ OvsInjectPacketThroughActions(PNET_BUFFER_LIST pNbl,
                           sendCompleteFlags);
 
     {
-        POVS_VPORT_ENTRY vport;
-        UINT32 portNo;
-        OVS_PACKET_HDR_INFO layers;
-        OvsFlowKey key;
-        UINT64 hash;
-        PNET_BUFFER curNb;
-        OvsFlow *flow;
+        POVS_VPORT_ENTRY vport = NULL;
+        UINT32 portNo = 0;
+        OVS_PACKET_HDR_INFO layers = { 0 };
+        OvsFlowKey key = { 0 };
+        UINT64 hash = 0;
+        PNET_BUFFER curNb = NULL;
+        OvsFlow *flow = NULL;
 
         fwdDetail = NET_BUFFER_LIST_SWITCH_FORWARDING_DETAIL(pNbl);
 
@@ -285,9 +275,9 @@ OvsInjectPacketThroughActions(PNET_BUFFER_LIST pNbl,
 
         SendFlags |= NDIS_SEND_FLAGS_DISPATCH_LEVEL;
 
-        vport = OvsFindTunnelVportByDstPort(gOvsSwitchContext,
-                                            htons(tunnelKey.dst_port),
-                                            OVS_VPORT_TYPE_VXLAN);
+        vport = OvsFindTunnelVportByDstPortAndType(gOvsSwitchContext,
+                                                   htons(tunnelKey.dst_port),
+                                                   OVS_VPORT_TYPE_VXLAN);
 
         if (vport == NULL){
             status = STATUS_UNSUCCESSFUL;
@@ -309,8 +299,8 @@ OvsInjectPacketThroughActions(PNET_BUFFER_LIST pNbl,
             datapath->hits++;
 
             OvsActionsExecute(gOvsSwitchContext, &completionList, pNbl,
-                            portNo, SendFlags, &key, &hash, &layers,
-                            flow->actions, flow->actionsLen);
+                              portNo, SendFlags, &key, &hash, &layers,
+                              flow->actions, flow->actionsLen);
 
             OvsReleaseDatapath(datapath, &dpLockState);
         } else {
@@ -318,8 +308,8 @@ OvsInjectPacketThroughActions(PNET_BUFFER_LIST pNbl,
 
             datapath->misses++;
             elem = OvsCreateQueueNlPacket(NULL, 0, OVS_PACKET_CMD_MISS,
-                                        portNo, &key, pNbl, curNb,
-                                        TRUE, &layers);
+                                          vport, &key, pNbl, curNb,
+                                          TRUE, &layers);
             if (elem) {
                 /* Complete the packet since it was copied to user buffer. */
                 InsertTailList(&missedPackets, &elem->link);

@@ -21,9 +21,9 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "socket-util.h"
-#include "type-props.h"
+#include "openvswitch/type-props.h"
 #include "util.h"
 #include "openvswitch/vlog.h"
 

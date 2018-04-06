@@ -16,6 +16,7 @@
 *.lib
 *.pdb
 *.pyc
+*.retry
 *.so
 *.suo
 **/*.sym
@@ -29,6 +30,7 @@
 .dirstamp
 .libs
 .tmp_versions
+.vagrant
 .gitattributes
 /Makefile
 /Makefile.in
@@ -49,6 +51,9 @@
 /configure-stamp
 /depcomp
 /distfiles
+/dist-docs
+/flake8-check
+/docs-check
 /install-sh
 /libtool
 /manpage-check
@@ -67,3 +72,9 @@ odp-netlink.h
 OvsDpInterface.h
 /.vagrant/
 testsuite.tmp.orig
+/rpm/
+/openvswitch*.tar.gz
+/tests/lcov/
+/Documentation/_build
+/.venv
+/cxx-check

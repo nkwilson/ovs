@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@
 #include "cfm.h"
 #include "classifier.h"
 #include "flow.h"
-#include "meta-flow.h"
+#include "openvswitch/meta-flow.h"
 #include "netflow.h"
 #include "rstp.h"
 #include "smap.h"
@@ -82,6 +82,7 @@ struct ofproto_ipfix_bridge_exporter_options {
     bool enable_tunnel_sampling;
     bool enable_input_sampling;
     bool enable_output_sampling;
+    char *virtual_obs_id;
 };
 
 struct ofproto_ipfix_flow_exporter_options {
@@ -89,6 +90,8 @@ struct ofproto_ipfix_flow_exporter_options {
     struct sset targets;
     uint32_t cache_active_timeout;
     uint32_t cache_max_flows;
+    bool enable_tunnel_sampling;
+    char *virtual_obs_id;
 };
 
 struct ofproto_rstp_status {
@@ -238,8 +241,9 @@ int ofproto_type_run(const char *datapath_type);
 void ofproto_type_wait(const char *datapath_type);
 
 int ofproto_create(const char *datapath, const char *datapath_type,
-                   struct ofproto **ofprotop);
-void ofproto_destroy(struct ofproto *);
+                   struct ofproto **ofprotop)
+    OVS_EXCLUDED(ofproto_mutex);
+void ofproto_destroy(struct ofproto *, bool del);
 int ofproto_delete(const char *name, const char *type);
 
 int ofproto_run(struct ofproto *);
@@ -286,10 +290,12 @@ int ofproto_port_dump_done(struct ofproto_port_dump *);
 #define OFPROTO_FLOW_LIMIT_DEFAULT 200000
 #define OFPROTO_MAX_IDLE_DEFAULT 10000 /* ms */
 
-const char *ofproto_port_open_type(const char *datapath_type,
+const char *ofproto_port_open_type(const struct ofproto *,
                                    const char *port_type);
 int ofproto_port_add(struct ofproto *, struct netdev *, ofp_port_t *ofp_portp);
 int ofproto_port_del(struct ofproto *, ofp_port_t ofp_port);
+void ofproto_port_set_config(struct ofproto *, ofp_port_t ofp_port,
+                             const struct smap *cfg);
 int ofproto_port_get_stats(const struct ofport *, struct netdev_stats *stats);
 
 int ofproto_port_query_by_name(const struct ofproto *, const char *devname,
@@ -316,8 +322,8 @@ int ofproto_set_mcast_snooping(struct ofproto *ofproto,
 int ofproto_port_set_mcast_snooping(struct ofproto *ofproto, void *aux,
                           const struct ofproto_mcast_snooping_port_settings *s);
 void ofproto_set_threads(int n_handlers, int n_revalidators);
-void ofproto_set_n_dpdk_rxqs(int n_rxqs);
-void ofproto_set_cpu_mask(const char *cmask);
+void ofproto_type_set_config(const char *type,
+                             const struct smap *other_config);
 void ofproto_set_dp_desc(struct ofproto *, const char *dp_desc);
 int ofproto_set_snoops(struct ofproto *, const struct sset *snoops);
 int ofproto_set_netflow(struct ofproto *,
@@ -334,6 +340,7 @@ int ofproto_get_stp_status(struct ofproto *, struct ofproto_stp_status *);
 
 int ofproto_set_rstp(struct ofproto *, const struct ofproto_rstp_settings *);
 int ofproto_get_rstp_status(struct ofproto *, struct ofproto_rstp_status *);
+void ofproto_set_vlan_limit(int vlan_limit);
 
 /* Configuration of ports. */
 void ofproto_port_unregister(struct ofproto *, ofp_port_t ofp_port);
@@ -381,7 +388,11 @@ enum port_vlan_mode {
     /* Untagged incoming packets are part of 'vlan', as are incoming packets
      * tagged with 'vlan'.  Outgoing packets tagged with 'vlan' are untagged.
      * Other VLANs in 'trunks' are trunked. */
-    PORT_VLAN_NATIVE_UNTAGGED
+    PORT_VLAN_NATIVE_UNTAGGED,
+
+    /* 802.1q tunnel port. Incoming packets are added an outer vlan tag
+     * 'vlan'. If 'cvlans' is set, only allows VLANs in 'cvlans'. */
+    PORT_VLAN_DOT1Q_TUNNEL
 };
 
 /* Configuration of bundles. */
@@ -392,8 +403,10 @@ struct ofproto_bundle_settings {
     size_t n_slaves;
 
     enum port_vlan_mode vlan_mode; /* Selects mode for vlan and trunks */
+    uint16_t qinq_ethtype;
     int vlan;                   /* VLAN VID, except for PORT_VLAN_TRUNK. */
     unsigned long *trunks;      /* vlan_bitmap, except for PORT_VLAN_ACCESS. */
+    unsigned long *cvlans;
     bool use_priority_tags;     /* Use 802.1p tag for frames in VLAN 0? */
 
     struct bond_settings *bond; /* Must be nonnull iff if n_slaves > 1. */
@@ -401,13 +414,7 @@ struct ofproto_bundle_settings {
     struct lacp_settings *lacp;              /* Nonnull to enable LACP. */
     struct lacp_slave_settings *lacp_slaves; /* Array of n_slaves elements. */
 
-    /* Linux VLAN device support (e.g. "eth0.10" for VLAN 10.)
-     *
-     * This is deprecated.  It is only for compatibility with broken device
-     * drivers in old versions of Linux that do not properly support VLANs when
-     * VLAN devices are not used.  When broken device drivers are no longer in
-     * widespread use, we will delete these interfaces. */
-    ofp_port_t realdev_ofp_port;/* OpenFlow port number of real device. */
+    bool protected;             /* Protected port mode */
 };
 
 int ofproto_bundle_register(struct ofproto *, void *aux,
@@ -433,6 +440,8 @@ struct ofproto_mirror_settings {
     /* Output (mutually exclusive). */
     void *out_bundle;           /* A registered ofbundle handle or NULL. */
     uint16_t out_vlan;          /* Output VLAN, only if out_bundle is NULL. */
+    uint16_t snaplen;           /* Max packet size of a mirrored packet
+                                   in byte, set to 0 equals 65535. */
 };
 
 int ofproto_mirror_register(struct ofproto *, void *aux,
@@ -504,18 +513,6 @@ bool ofproto_port_cfm_status_changed(struct ofproto *, ofp_port_t ofp_port);
 int ofproto_port_get_cfm_status(const struct ofproto *,
                                 ofp_port_t ofp_port,
                                 struct cfm_status *);
-
-/* Linux VLAN device support (e.g. "eth0.10" for VLAN 10.)
- *
- * This is deprecated.  It is only for compatibility with broken device drivers
- * in old versions of Linux that do not properly support VLANs when VLAN
- * devices are not used.  When broken device drivers are no longer in
- * widespread use, we will delete these interfaces. */
-
-void ofproto_get_vlan_usage(struct ofproto *, unsigned long int *vlan_bitmap);
-bool ofproto_has_vlan_usage_changed(const struct ofproto *);
-int ofproto_port_set_realdev(struct ofproto *, ofp_port_t vlandev_ofp_port,
-                             ofp_port_t realdev_ofp_port, int vid);
 
 /* Table configuration */
 

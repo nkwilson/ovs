@@ -20,11 +20,9 @@
 #define _LLDPD_STRUCTS_H
 
 #include <net/if.h>
-#ifndef _WIN32
-#include <netinet/in.h>
-#endif
-#include <sys/socket.h>
 #include <sys/types.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include "aa-structs.h"
 #include "lldp-const.h"
 #include "packets.h"
@@ -182,7 +180,7 @@ struct lldpd_hardware {
                                    * to 0. */
     int               h_ifindex;  /* Interface index, used by SNMP */
     char              h_ifname[IFNAMSIZ]; /* Should be unique */
-    u_int8_t          h_lladdr[ETH_ADDR_LEN];
+    struct eth_addr   h_lladdr;
 
     u_int64_t         h_tx_cnt;
     u_int64_t         h_rx_cnt;

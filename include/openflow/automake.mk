@@ -1,5 +1,6 @@
 openflowincludedir = $(includedir)/openflow
 openflowinclude_HEADERS = \
+	include/openflow/intel-ext.h \
 	include/openflow/netronome-ext.h \
 	include/openflow/nicira-ext.h \
 	include/openflow/openflow-1.0.h \
@@ -8,6 +9,7 @@ openflowinclude_HEADERS = \
 	include/openflow/openflow-1.3.h \
 	include/openflow/openflow-1.4.h \
 	include/openflow/openflow-1.5.h \
+	include/openflow/openflow-1.6.h \
 	include/openflow/openflow-common.h \
 	include/openflow/openflow.h
 

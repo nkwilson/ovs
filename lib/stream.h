@@ -37,10 +37,6 @@ int stream_open(const char *name, struct stream **, uint8_t dscp);
 int stream_open_block(int error, struct stream **);
 void stream_close(struct stream *);
 const char *stream_get_name(const struct stream *);
-ovs_be32 stream_get_remote_ip(const struct stream *);
-ovs_be16 stream_get_remote_port(const struct stream *);
-ovs_be32 stream_get_local_ip(const struct stream *);
-ovs_be16 stream_get_local_port(const struct stream *);
 int stream_connect(struct stream *);
 int stream_recv(struct stream *, void *buffer, size_t n);
 int stream_send(struct stream *, const void *buffer, size_t n);
@@ -57,6 +53,8 @@ void stream_wait(struct stream *, enum stream_wait_type);
 void stream_connect_wait(struct stream *);
 void stream_recv_wait(struct stream *);
 void stream_send_wait(struct stream *);
+void stream_set_peer_id(struct stream *, const char *);
+const char *stream_get_peer_id(const struct stream *);
 
 /* Passive streams: listeners for incoming stream connections. */
 int pstream_verify_name(const char *name);

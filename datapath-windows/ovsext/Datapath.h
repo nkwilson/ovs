@@ -51,6 +51,8 @@ typedef struct _OVS_OPEN_INSTANCE {
     PVOID eventQueue;
     POVS_USER_PACKET_QUEUE packetQueue;
     UINT32 pid;
+    UINT32 protocol;    /* Refers to NETLINK Family (eg. NETLINK_GENERIC)*/
+    UINT32 mcastMask;   /* Mask of subscribed Mcast Groups */
 
     struct {
         POVS_MESSAGE ovsMsg;    /* OVS message passed during dump start. */
@@ -65,7 +67,7 @@ typedef struct _OVS_OPEN_INSTANCE {
 
 NDIS_STATUS OvsCreateDeviceObject(NDIS_HANDLE ovsExtDriverHandle);
 VOID OvsDeleteDeviceObject();
-VOID OvsInit();
+NDIS_STATUS OvsInit();
 VOID OvsCleanup();
 
 POVS_OPEN_INSTANCE OvsGetOpenInstance(PFILE_OBJECT fileObject,
@@ -73,7 +75,15 @@ POVS_OPEN_INSTANCE OvsGetOpenInstance(PFILE_OBJECT fileObject,
 
 NTSTATUS OvsCompleteIrpRequest(PIRP irp, ULONG_PTR infoPtr, NTSTATUS status);
 
+_IRQL_raises_(DISPATCH_LEVEL)
+_IRQL_saves_global_(OldIrql, gOvsCtrlLock)
+_Acquires_lock_(gOvsCtrlLock)
 VOID OvsAcquireCtrlLock();
+
+_IRQL_requires_(DISPATCH_LEVEL)
+_IRQL_restores_global_(OldIrql, gOvsCtrlLock)
+_Requires_lock_held_(gOvsCtrlLock)
+_Releases_lock_(gOvsCtrlLock)
 VOID OvsReleaseCtrlLock();
 
 /*

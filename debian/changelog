@@ -1,21 +1,399 @@
-openvswitch (2.4.90-1) unstable; urgency=low
+openvswitch (2.9.90-1) unstable; urgency=low
+
+   * New upstream version
+
+ -- Open vSwitch team <dev@openvswitch.org>  Wed, 17 Jan 2018 09:52:17 -0700
+
+openvswitch (2.9.0-1) unstable; urgency=low
+
+   * New upstream version
+
+ -- Open vSwitch team <dev@openvswitch.org>  Mon, 19 Feb 2018 11:03:12 -0700
+
+openvswitch (2.8.0-1) unstable; urgency=medium
+
+   [ Open vSwitch team ]
+   * Use debhelper for DEB_VERSION_UPSTREAM.  Thanks to Clint Byrum
+     <spamaps@debian.org> for this improvement.
+   * New upstream version
+
+ -- Open vSwitch team <dev@openvswitch.org>  Thu, 31 Aug 2017 09:32:16 -0700
+
+openvswitch (2.7.0-1) unstable; urgency=low
    [ Open vSwitch team ]
    * New upstream version
-    - Nothing yet!  Try NEWS...
+   - Utilities and daemons that support SSL now allow protocols and
+     ciphers to be configured with --ssl-protocols and --ssl-ciphers.
+   - OVN:
+     * QoS is now implemented via egress shaping rather than ingress policing.
+     * DSCP marking is now supported, via the new northbound QoS table.
+     * IPAM now supports fixed MAC addresses.
+     * Support for source IP address based routing.
+     * ovn-trace:
+       - New --ovs option to also print OpenFlow flows.
+       - put_dhcp_opts and put_dhcp_optsv6 actions may now be traced.
+     * Support for managing SSL and remote connection configuration in
+       northbound and southbound databases.
+     * TCP connections to northbound and southbound databases are no
+       longer enabled by default and must be explicitly configured.
+       See documentation for ovn-sbctl/ovn-nbctl "set-connection"
+       command or the ovn-ctl "--db-sb-create-insecure-remote" and
+       "--db-nb-create-insecure-remote" command-line options for
+       information regarding remote connection configuration.
+     * New appctl "inject-pkt" command in ovn-controller that allows
+       packets to be injected into the connected OVS instance.
+     * Distributed logical routers may now be connected directly to
+       logical switches with localnet ports, by specifying a
+       "redirect-chassis" on the distributed gateway port of the
+       logical router.  NAT rules may be specified directly on the
+       distributed logical router, and are handled either centrally on
+       the "redirect-chassis", or in many cases are handled locally on
+       the hypervisor where the corresponding logical port resides.
+       Gratuitous ARP for NAT addresses on a distributed logical
+       router is not yet supported, but will be added in a future
+       version.
+   - Fixed regression in table stats maintenance introduced in OVS
+     2.3.0, wherein the number of OpenFlow table hits and misses was
+     not accurate.
+   - OpenFlow:
+     * OFPT_PACKET_OUT messages are now supported in bundles.
+     * A new "selection_method=dp_hash" type for OpenFlow select group
+       bucket selection that uses the datapath computed 5-tuple hash
+       without making datapath flows match the 5-tuple fields, which
+       is useful for more efficient load balancing, for example.  This
+       uses the Netronome extension to OpenFlow 1.5+ that allows
+       control over the OpenFlow select groups selection method.  See
+       "selection_method" and related options in ovs-ofctl(8) for
+       details.
+     * The "sample" action now supports "ingress" and "egress" options.
+     * The "ct" action now supports the TFTP ALG where support is available.
+     * New actions "clone" and "ct_clear".
+   - ovs-ofctl:
+     * 'bundle' command now supports packet-out messages.
+     * New syntax for 'ovs-ofctl packet-out' command, which uses the
+       same string parser as the 'bundle' command.  The old 'packet-out'
+       syntax is deprecated and will be removed in a later OVS
+       release.
+     * New unixctl "ofctl/packet-out" command, which can be used to
+       instruct a flow monitor to issue OpenFlow packet-out messages.
+   - ovsdb-server:
+     * Remote connections can now be made read-only (see ovsdb-server(1)).
+   - Tunnels:
+     * TLV mappings for protocols such as Geneve are now segregated on
+       a per-OpenFlow bridge basis rather than globally. (The interface
+       has not changed.)
+     * Removed support for IPsec tunnels.
+   - DPDK:
+     * New option 'n_rxq_desc' and 'n_txq_desc' fields for DPDK interfaces
+       which set the number of rx and tx descriptors to use for the given port.
+     * Support for DPDK v16.11.
+     * Support for rx checksum offload. Refer DPDK HOWTO for details.
+     * Port Hotplug is now supported.
+     * DPDK physical ports can now have arbitrary names. The PCI address of
+       the device must be set using the 'dpdk-devargs' option. Compatibility
+       with the old dpdk<portid> naming scheme is broken, and as such a
+       device will not be available for use until a valid dpdk-devargs is
+       specified.
+     * Virtual DPDK Poll Mode Driver (vdev PMD) support.
+     * Removed experimental tag.
+   - Fedora packaging:
+     * A package upgrade does not automatically restart OVS service.
+   - ovs-vswitchd/ovs-vsctl:
+     * Ports now have a "protected" flag. Protected ports can not forward
+       frames to other protected ports. Unprotected ports can receive and
+       forward frames to protected and other unprotected ports.
+   - ovs-vsctl, ovn-nbctl, ovn-sbctl, vtep-ctl:
+     * Database commands now accept integer ranges, e.g. "set port
+       eth0 trunks=1-10" to enable trunking VLANs 1 to 10.
 
- -- Open vSwitch team <dev@openvswitch.org>  Wed, 17 Jun 2015 16:09:32 -0700
+ -- Open vSwitch team <dev@openvswitch.org>  Tue, 21 Feb 2017 13:57:33 -0700
+
+openvswitch (2.6.0-1) unstable; urgency=low
+   [ Open vSwitch team ]
+   * New upstream version
+   - First supported release of OVN.  See ovn-architecture(7) for more
+     details.
+   - ovsdb-server:
+     * New "monitor_cond" "monitor_cond_update" and "update2" extensions to
+       RFC 7047.
+   - OpenFlow:
+     * OpenFlow 1.3+ bundles are now supported for group mods as well as
+       flow mods and port mods.  Both 'atomic' and 'ordered' bundle
+       flags are supported for group mods as well as flow mods.
+     * OpenFlow 1.1+ OFPT_QUEUE_GET_CONFIG_REQUEST now supports OFPP_ANY.
+     * OpenFlow 1.4+ OFPMP_QUEUE_DESC is now supported.
+     * OpenFlow 1.4+ OFPT_TABLE_STATUS is now supported.
+     * New property-based packet-in message format NXT_PACKET_IN2 with support
+       for arbitrary user-provided data and for serializing flow table
+       traversal into a continuation for later resumption.
+     * New extension message NXT_SET_ASYNC_CONFIG2 to allow OpenFlow 1.4-like
+       control over asynchronous messages in earlier versions of OpenFlow.
+     * OpenFlow 1.3 Extension 230, adding OpenFlow Bundles support, is
+       now implemented.  Only flow mod and port mod messages are supported
+       in bundles.
+     * New OpenFlow extension NXM_NX_MPLS_TTL to provide access to MPLS TTL.
+     * New output option, output(port=N,max_len=M), to allow truncating a
+       packet to size M bytes when outputting to port N.
+     * New command OFPGC_ADD_OR_MOD for OFPT_GROUP_MOD message that adds a
+       new group or modifies an existing groups
+     * The optional OpenFlow packet buffering feature is deprecated in
+       this release, and will be removed in the next OVS release
+       (2.7).  After the change OVS always sends the 'buffer_id' as
+       0xffffffff in packet-in messages and will send an error
+       response if any other value of this field is included in
+       packet-out and flow mod sent by a controller.  Controllers are
+       already expected to work properly in cases where the switch can
+       not buffer packets, so this change should not affect existing
+       users.
+     * New OpenFlow extension NXT_CT_FLUSH_ZONE to flush conntrack zones.
+   - Improved OpenFlow version compatibility for actions:
+     * New OpenFlow extension to support the "group" action in OpenFlow 1.0.
+     * OpenFlow 1.0 "enqueue" action now properly translated to OpenFlow 1.1+.
+     * OpenFlow 1.1 "mod_nw_ecn" and OpenFlow 1.1+ "mod_nw_ttl" actions now
+       properly translated to OpenFlow 1.0.
+   - ovs-ofctl:
+     * queue-get-config command now allows a queue ID to be specified.
+     * '--bundle' option can now be used with OpenFlow 1.3 and with group mods.
+     * New "bundle" command allows executing a mixture of flow and group mods
+       as a single atomic transaction.
+     * New option "--color" to produce colorized output for some commands.
+     * New option '--may-create' to use OFPGC_ADD_OR_MOD in mod-group command.
+   - IPFIX:
+     * New "sampling_port" option for "sample" action to allow sampling
+       ingress and egress tunnel metadata with IPFIX.
+     * New ovs-ofctl commands "dump-ipfix-bridge" and "dump-ipfix-flow" to
+       dump bridge IPFIX statistics and flow based IPFIX statistics.
+     * New setting other-config:virtual_obs_id to add an arbitrary string
+       to IPFIX records.
+   - Linux:
+     * New QoS type "linux-noop" that prevents Open vSwitch from trying to
+       manage QoS for a given port (useful when other software manages QoS).
+   - DPDK:
+     * New option "n_rxq" for PMD interfaces.
+       Old 'other_config:n-dpdk-rxqs' is no longer supported.
+       Not supported by vHost interfaces. For them number of rx and tx queues
+       is applied from connected virtio device.
+     * New 'other_config:pmd-rxq-affinity' field for PMD interfaces, that
+       allows to pin port's rx queues to desired cores.
+     * New appctl command 'dpif-netdev/pmd-rxq-show' to check the port/rxq
+       assignment.
+     * Type of log messages from PMD threads changed from INFO to DBG.
+     * QoS functionality with sample egress-policer implementation.
+     * The mechanism for configuring DPDK has changed to use database
+     * Sensible defaults have been introduced for many of the required
+       configuration options
+     * DB entries have been added for many of the DPDK EAL command line
+       arguments. Additional arguments can be passed via the dpdk-extra
+       entry.
+     * Add ingress policing functionality.
+     * PMD threads servicing vHost User ports can now come from the NUMA
+       node that device memory is located on if CONFIG_RTE_LIBRTE_VHOST_NUMA
+       is enabled in DPDK.
+     * Basic connection tracking for the userspace datapath (no ALG,
+       fragmentation or NAT support yet)
+     * Support for DPDK 16.07
+     * Optional support for DPDK pdump enabled.
+     * Jumbo frame support
+     * Remove dpdkvhostcuse port type.
+     * OVS client mode for vHost and vHost reconnect (Requires QEMU 2.7)
+   - Increase number of registers to 16.
+   - ovs-benchmark: This utility has been removed due to lack of use and
+     bitrot.
+   - ovs-appctl:
+     * New "vlog/close" command.
+   - ovs-ctl:
+     * Added the ability to selectively start the forwarding and database
+       functions (ovs-vswitchd and ovsdb-server, respectively).
+   - ovsdb-server:
+     * Remove max number of sessions limit, to enable connection scaling
+       testing.
+   - python:
+     * Added support for Python 3.4+ in addition to existing support
+       for 2.7+.
+   - SELinux:
+     * Introduced SELinux policy package.
+   - Datapath Linux kernel compatibility.
+     * Dropped support for kernel older than 3.10.
+     * Removed VLAN splinters feature.
+     * Support for truncate action.
+     * Datapath supports kernel upto 4.6.
+   - Tunnels:
+     * Flow based tunnel match and action can be used for IPv6 address using
+       tun_ipv6_src, tun_ipv6_dst fields.
+     * Added support for IPv6 tunnels, for details checkout FAQ.
+     * Deprecated support for IPsec tunnels ports.
+   - A wrapper script, 'ovs-tcpdump', to easily port-mirror an OVS port and
+     watch with tcpdump
+   - Introduce --no-self-confinement flag that allows daemons to work with
+     sockets outside their run directory.
+   - ovs-pki: Changed message digest algorithm from SHA-1 to SHA-512 because
+     SHA-1 is no longer secure and some operating systems have started to
+     disable it in OpenSSL.
+   - Add 'mtu_request' column to the Interface table. It can be used to
+     configure the MTU of non-internal ports.
+
+ -- Open vSwitch team <dev@openvswitch.org>  Mon, 15 Aug 2016 19:53:13 -0700
+
+openvswitch (2.5.0-1) unstable; urgency=low
+   [ Open vSwitch team ]
+   * New upstream version
+   - Dropped support for Python older than version 2.7.  As a consequence,
+     using Open vSwitch 2.5 or later on XenServer 6.5 or earlier (which
+     have Python 2.4) requires first installing Python 2.7.
+   - OpenFlow:
+     * Group chaining (where one OpenFlow group triggers another) is
+       now supported.
+     * OpenFlow 1.4+ "importance" is now considered for flow eviction.
+     * OpenFlow 1.4+ OFPTC_EVICTION is now implemented.
+     * OpenFlow 1.4+ OFPTC_VACANCY_EVENTS is now implemented.
+     * OpenFlow 1.4+ OFPMP_TABLE_DESC is now implemented.
+     * Allow modifying the ICMPv4/ICMPv6 type and code fields.
+     * OpenFlow 1.4+ OFPT_SET_ASYNC_CONFIG and OFPT_GET_ASYNC_CONFIG are
+       now implemented.
+   - ovs-ofctl:
+     * New "out_group" keyword for OpenFlow 1.1+ matching on output group.
+   - Tunnels:
+     * Geneve tunnels can now match and set options and the OAM bit.
+     * The nonstandard GRE64 tunnel extension has been dropped.
+   - Support Multicast Listener Discovery (MLDv1 and MLDv2).
+   - Add 'symmetric_l3l4' and 'symmetric_l3l4+udp' hash functions.
+   - sFlow agent now reports tunnel and MPLS structures.
+   - New 'check-system-userspace', 'check-kmod' and 'check-kernel' Makefile
+     targets to run a new system testsuite.  These tests can be run inside
+     a Vagrant box.  See INSTALL.md for details
+   - Mark --syslog-target argument as deprecated.  It will be removed in
+     the next OVS release.
+   - Added --user option to all daemons
+   - Add support for connection tracking through the new "ct" action
+     and "ct_state"/"ct_zone"/"ct_mark"/"ct_label" match fields.  Only
+     available on Linux kernels with the connection tracking module loaded.
+   - Add experimental version of OVN.  OVN, the Open Virtual Network, is a
+     system to support virtual network abstraction.  OVN complements the
+     existing capabilities of OVS to add native support for virtual network
+     abstractions, such as virtual L2 and L3 overlays and security groups.
+
+ -- Open vSwitch team <dev@openvswitch.org>  Thu, 03 Dec 2015 23:17:44 -0700
 
 openvswitch (2.4.0-1) unstable; urgency=low
    [ Open vSwitch team ]
+   * New upstream version
+   - Flow table modifications are now atomic, meaning that each packet
+     now sees a coherent version of the OpenFlow pipeline.  For
+     example, if a controller removes all flows with a single OpenFlow
+     "flow_mod", no packet sees an intermediate version of the OpenFlow
+     pipeline where only some of the flows have been deleted.
+   - Added support for SFQ, FQ_CoDel and CoDel qdiscs.
+   - Add bash command-line completion support for ovs-vsctl Please check
+     utilities/ovs-command-compgen.INSTALL.md for how to use.
+   - The MAC learning feature now includes per-port fairness to mitigate
+     MAC flooding attacks.
+   - New support for a "conjunctive match" OpenFlow extension, which
+     allows constructing OpenFlow matches of the form "field1 in
+     {a,b,c...} AND field2 in {d,e,f...}" and generalizations.  For details,
+     see documentation for the "conjunction" action in ovs-ofctl(8).
+   - Add bash command-line completion support for ovs-appctl/ovs-dpctl/
+     ovs-ofctl/ovsdb-tool commands.  Please check
+     utilities/ovs-command-compgen.INSTALL.md for how to use.
+   - The "learn" action supports a new flag "delete_learned" that causes
+     the learned flows to be deleted when the flow with the "learn" action
+     is deleted.
+   - Basic support for the Geneve tunneling protocol. It is not yet
+     possible to generate or match options. This is planned for a future
+     release. The protocol is documented at
+     http://tools.ietf.org/html/draft-gross-geneve-00
+   - The OVS database now reports controller rate limiting statistics.
+   - sflow now exports information about LACP-based bonds, port names, and
+     OpenFlow port numbers, as well as datapath performance counters.
+   - ovs-dpctl functionality is now available for datapaths integrated
+     into ovs-vswitchd, via ovs-appctl.  Some existing ovs-appctl
+     commands are now redundant and will be removed in a future
+     release.  See ovs-vswitchd(8) for details.
+   - OpenFlow:
+     * OpenFlow 1.4 bundles are now supported for flow mods and port
+       mods.  For flow mods, both 'atomic' and 'ordered' bundle flags
+       are trivially supported, as all bundled messages are executed
+       in the order they were added and all flow table modifications
+       are now atomic to the datapath.  Port mods may not appear in
+       atomic bundles, as port status modifications are not atomic.
+     * IPv6 flow label and neighbor discovery fields are now modifiable.
+     * OpenFlow 1.5 extended registers are now supported.
+     * The OpenFlow 1.5 actset_output field is now supported.
+     * OpenFlow 1.5 Copy-Field action is now supported.
+     * OpenFlow 1.5 masked Set-Field action is now supported.
+     * OpenFlow 1.3+ table features requests are now supported (read-only).
+     * Nicira extension "move" actions may now be included in action sets.
+     * "resubmit" actions may now be included in action sets.  The resubmit
+       is executed last, and only if the action set has no "output" or "group"
+       action.
+     * OpenFlow 1.4+ flow "importance" is now maintained in the flow table.
+     * A new Netronome extension to OpenFlow 1.5+ allows control over the
+       fields hashed for OpenFlow select groups.  See "selection_method" and
+       related options in ovs-ofctl(8) for details.
+   - ovs-ofctl has a new '--bundle' option that makes the flow mod commands
+     ('add-flow', 'add-flows', 'mod-flows', 'del-flows', and 'replace-flows')
+     use an OpenFlow 1.4 bundle to operate the modifications as a single
+     atomic transaction.  If any of the flow mods in a transaction fail, none
+     of them are executed.  All flow mods in a bundle appear to datapath
+     lookups simultaneously.
+   - ovs-ofctl 'add-flow' and 'add-flows' commands now accept arbitrary flow
+     mods as an input by allowing the flow specification to start with an
+     explicit 'add', 'modify', 'modify_strict', 'delete', or 'delete_strict'
+     keyword.  A missing keyword is treated as 'add', so this is fully
+     backwards compatible.  With the new '--bundle' option all the flow mods
+     are executed as a single atomic transaction using an OpenFlow 1.4 bundle.
+   - ovs-pki: Changed message digest algorithm from MD5 to SHA-1 because
+     MD5 is no longer secure and some operating systems have started to disable
+     it in OpenSSL.
+   - ovsdb-server: New OVSDB protocol extension allows inequality tests on
+     "optional scalar" columns.  See ovsdb-server(1) for details.
+   - ovs-vsctl now permits immutable columns in a new row to be modified in
+     the same transaction that creates the row.
+   - test-controller has been renamed ovs-testcontroller at request of users
+     who find it useful for testing basic OpenFlow setups.  It is still not
+     a necessary or desirable part of most Open vSwitch deployments.
+   - Support for travis-ci.org based continuous integration builds has been
+     added. Build failures are reported to build@openvswitch.org. See INSTALL.md
+     file for additional details.
+   - Support for the Rapid Spanning Tree Protocol (IEEE 802.1D-2004).
+     The implementation has been tested successfully against the Ixia Automated
+     Network Validation Library (ANVL).
+   - Stats are no longer updated on fake bond interface.
+   - Keep active bond slave selection across OVS restart.
+   - A simple wrapper script, 'ovs-docker', to integrate OVS with Docker
+     containers. If and when there is a native integration of Open vSwitch
+     with Docker, the wrapper script will be retired.
+   - Added support for DPDK Tunneling. VXLAN, GRE, and Geneve are supported
+     protocols. This is generic tunneling mechanism for userspace datapath.
+   - Support for multicast snooping (IGMPv1, IGMPv2 and IGMPv3)
+   - Support for Linux kernels up to 4.0.x
+   - The documentation now use the term 'destination' to mean one of syslog,
+     console or file for vlog logging instead of the previously used term
+     'facility'.
+   - Support for VXLAN Group Policy extension
+   - Initial support for the IETF Auto-Attach SPBM draft standard. This
+     contains rudimentary support for the LLDP protocol as needed for
+     Auto-Attach.
+   - The default OpenFlow and OVSDB ports are now the IANA-assigned
+     numbers.  OpenFlow is 6653 and OVSDB is 6640.
+   - Support for DPDK vHost.
+   - Support for outer UDP checksums in Geneve and VXLAN.
+   - The kernel vports with dependencies are no longer part of the overall
+     openvswitch.ko but built and loaded automatically as individual kernel
+     modules (vport-*.ko).
+   - Support for STT tunneling.
+   - Support to configure method (--syslog-method argument) that determines
+     how daemons will talk with syslog.
+   - Support for "ovs-appctl vlog/list-pattern" command that lets to query
+     logging message format for each destination.
+   - GRE64 and ipsec_gre64 tunnel protocol is deprecated and will be removed
+     from OVS v2.5 release.
    * The openvswitch-testcontroller package is new.  It reintroduces the
      simple OpenFlow controller that was packaged with Open vSwitch prior to
      version 2.1, at request of users who find it useful for testing basic
      OpenFlow setups.  It is still not a necessary or desirable part of most
      Open vSwitch deployments.
-   * New upstream version
-    - Nothing yet!  Try NEWS...
 
- -- Open vSwitch team <dev@openvswitch.org>  Wed, 17 Jun 2015 16:09:32 -0700
+ -- Open vSwitch team <dev@openvswitch.org>  Thu, 20 Aug 2015 17:23:43 -0700
 
 openvswitch (2.3.0-1) unstable; urgency=low
    [ Open vSwitch team ]

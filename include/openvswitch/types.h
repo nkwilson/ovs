@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2010, 2011, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2010, 2011, 2013, 2014, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,11 @@
 
 #include <sys/types.h>
 #include <stdint.h>
+#include "openvswitch/compiler.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #ifdef __CHECKER__
 #define OVS_BITWISE __attribute__((bitwise))
@@ -81,12 +86,48 @@ typedef struct {
 #endif
 } ovs_32aligned_u64;
 
+/* A 128-bit value, in host byte order, that is only aligned on a 32-bit
+ * boundary.  */
+typedef struct {
+    uint32_t u32[4];
+} ovs_32aligned_u128;
+
+/* A 128-bit value, in network byte order, that is only aligned on a 32-bit
+ * boundary.  */
+typedef struct {
+    ovs_be32 be32[4];
+} ovs_32aligned_be128;
+
 typedef union {
     uint32_t u32[4];
     struct {
+#ifdef WORDS_BIGENDIAN
+        uint64_t hi, lo;
+#else
         uint64_t lo, hi;
+#endif
     } u64;
 } ovs_u128;
+
+typedef union {
+    ovs_be32 be32[4];
+    struct {
+        ovs_be64 hi, lo;
+    } be64;
+} ovs_be128;
+
+/* MSVC2015 doesn't support designated initializers when compiling C++,
+ * and doesn't support ternary operators with non-designated initializers.
+ * So we use these static definitions rather than using initializer macros. */
+static const ovs_u128 OVS_U128_ZERO = { { 0, 0, 0, 0 } };
+static const ovs_u128 OVS_U128_MAX = { { UINT32_MAX, UINT32_MAX,
+                                         UINT32_MAX, UINT32_MAX } };
+static const ovs_be128 OVS_BE128_MAX OVS_UNUSED = { { OVS_BE32_MAX, OVS_BE32_MAX,
+                                           OVS_BE32_MAX, OVS_BE32_MAX } };
+static const ovs_u128 OVS_U128_MIN OVS_UNUSED = { {0, 0, 0, 0} };
+static const ovs_u128 OVS_BE128_MIN OVS_UNUSED = { {0, 0, 0, 0} };
+
+#define OVS_U128_ZERO OVS_U128_MIN
 
 /* A 64-bit value, in network byte order, that is only aligned on a 32-bit
  * boundary. */
@@ -94,10 +135,21 @@ typedef struct {
         ovs_be32 hi, lo;
 } ovs_32aligned_be64;
 
-/* ofp_port_t represents the port number of a OpenFlow switch.
- * odp_port_t represents the port number on the datapath.
- * ofp11_port_t represents the OpenFlow-1.1 port number. */
-typedef uint16_t OVS_BITWISE ofp_port_t;
+/* Port numbers
+ * ------------
+ *
+ * None of these types are directly interchangeable, hence the OVS_BITWISE
+ * annotation.
+ *
+ * ofp_port_t is an OpenFlow 1.0 port number.  It uses a 16-bit range, even
+ * though it is a 32-bit type.  This allows it to be overlaid on an odp_port_t
+ * for a few situations where this is useful, e.g. in union flow_in_port.
+ *
+ * ofp11_port_t is an OpenFlow-1.1 port number.
+ *
+ * odp_port_t is a port number within a datapath (e.g. see lib/dpif.h).
+ */
+typedef uint32_t OVS_BITWISE ofp_port_t;
 typedef uint32_t OVS_BITWISE odp_port_t;
 typedef uint32_t OVS_BITWISE ofp11_port_t;
 
@@ -105,5 +157,37 @@ typedef uint32_t OVS_BITWISE ofp11_port_t;
 #define OFP_PORT_C(X) ((OVS_FORCE ofp_port_t) (X))
 #define ODP_PORT_C(X) ((OVS_FORCE odp_port_t) (X))
 #define OFP11_PORT_C(X) ((OVS_FORCE ofp11_port_t) (X))
+
+/* Using this struct instead of a bare array makes an ethernet address field
+ * assignable.  The size of the array is also part of the type, so it is easier
+ * to deal with. */
+struct eth_addr {
+    union {
+        uint8_t ea[6];
+        ovs_be16 be16[3];
+    };
+};
+
+/* Ethernet address constant, e.g. ETH_ADDR_C(01,23,45,67,89,ab) is
+ * 01:23:45:67:89:ab. */
+#define ETH_ADDR_C(A,B,C,D,E,F) \
+    { { { 0x##A, 0x##B, 0x##C, 0x##D, 0x##E, 0x##F } } }
+
+/* Similar to struct eth_addr, for EUI-64 addresses. */
+struct eth_addr64 {
+    union {
+        uint8_t ea64[8];
+        ovs_be16 be16[4];
+    };
+};
+
+/* EUI-64 address constant, e.g. ETH_ADDR_C(01,23,45,67,89,ab,cd,ef) is
+ * 01:23:45:67:89:ab:cd:ef. */
+#define ETH_ADDR64_C(A,B,C,D,E,F,G,H) \
+    { { { 0x##A, 0x##B, 0x##C, 0x##D, 0x##E, 0x##F, 0x##G, 0x##H } } }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* openvswitch/types.h */

@@ -3,10 +3,10 @@
 set -e
 
 # Check command line.
-if test ! -d "$1" || test $# -lt 2; then
+if test ! -d "$1" || test $# != 1; then
     cat <<EOF
 $0: HTML documentation generator for Open vSwitch
-usage: $0 srcdir docfile...
+usage: $0 srcdir
 
 The VERSION environment variable should be set to the Open vSwitch version.
 Must be invoked from an Open vSwitch build directory.
@@ -24,17 +24,16 @@ search_path () {
     save_IFS=$IFS
     IFS=:
     for dir in $PATH; do
-	IFS=$save_IFS
-	if test -x "$dir/$1"; then
-	    return 0
-	fi
+        IFS=$save_IFS
+        if test -x "$dir/$1"; then
+            return 0
+        fi
     done
     IFS=$save_IFS
     echo >&2 "$0: $1 not found in \$PATH, please install and try again"
     exit 1
 }
 search_path man
-search_path markdown
 search_path ps2pdf
 
 # Create dist-docs directory.
@@ -44,7 +43,7 @@ rm -rf $distdir
 mkdir $distdir
 
 # Install manpages.
-make install-man mandir="$abs_distdir"/man
+${MAKE-make} install-man mandir="$abs_distdir"/man
 (cd $distdir && mv `find man -type f` . && rm -rf man)
 manpages=`cd $distdir && echo *`
 
@@ -56,43 +55,7 @@ cat >&3 <<EOF
   <link rel="stylesheet" type="text/css" href="style.css">
   <title>Open vSwitch $VERSION Documentation</title>
 </head><body>
-<h1>Open vSwitch $VERSION Documentation</h1>
-<h2>Documents</h2>
-<table>
-EOF
-
-# Add top-level documentation to index.html, giving it .txt extensions so
-# that the webserver doesn't serve it as Markdown and make your web browser
-# try to invoke some kind of external helper you don't have installed.
-#
-# Also translate documentation to HTML.
-for file
-do
-    title=`head -1 "$srcdir/$file"`
-    dir=$distdir/`dirname $file`; test -d "$dir" || mkdir "$dir"
-    cp "$srcdir/$file" "$distdir/$file.txt"
-    (cat <<EOF
-<html><head>
-  <meta charset="UTF-8"></head>
-  <link rel="stylesheet" type="text/css" href="style.css">
-  <title>$file (Open vSwitch $VERSION)</title>
-</head><body>
-EOF
-     markdown "$distdir/$file.txt"
-     echo "</body></html>") > "$distdir/$file.html"
-    cat <<EOF
-<tr>
-  <td>$file</td>
-  <td>$title</td>
-  <td><a href="$file.html">HTML</a>, <a href="$file.txt">plain text</a></td>
-</tr>
-EOF
-done >&3
-
-# Add header for manpages to index.html.
-cat >&3 <<EOF
-</table>
-<h2>Manpages</h2>
+<h1>Open vSwitch $VERSION Manpages</h1>
 <table>
 EOF
 
@@ -103,9 +66,9 @@ EOF
 (cd $distdir
  for manpage in $manpages; do
      man -l -Tps $manpage | ps2pdf - > $manpage.pdf
-     man -l -Tutf8 $manpage | sed 's/.//g' > $manpage.txt
+     GROFF_NO_SGR=1 man -l -Tutf8 $manpage | sed 's/.//g' > $manpage.txt
      (echo '<html><head><meta charset="UTF-8"></head><body><pre>'
-      man -l -Tutf8 $manpage | sed '
+      GROFF_NO_SGR=1 man -l -Tutf8 $manpage | sed '
 s/&/&amp;/g
 s/</&lt;/g
 s/>/&gt;/g

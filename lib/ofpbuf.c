@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
  */
 
 #include <config.h>
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
 #include <stdlib.h>
 #include <string.h>
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "netdev-dpdk.h"
 #include "util.h"
 
@@ -29,16 +29,16 @@ ofpbuf_init__(struct ofpbuf *b, size_t allocated, enum ofpbuf_source source)
     b->source = source;
     b->header = NULL;
     b->msg = NULL;
-    list_poison(&b->list_node);
+    ovs_list_poison(&b->list_node);
 }
 
 static void
-ofpbuf_use__(struct ofpbuf *b, void *base, size_t allocated,
+ofpbuf_use__(struct ofpbuf *b, void *base, size_t allocated, size_t size,
              enum ofpbuf_source source)
 {
     b->base = base;
     b->data = base;
-    b->size = 0;
+    b->size = size;
 
     ofpbuf_init__(b, allocated, source);
 }
@@ -47,10 +47,20 @@ ofpbuf_use__(struct ofpbuf *b, void *base, size_t allocated,
  * memory starting at 'base'.  'base' should be the first byte of a region
  * obtained from malloc().  It will be freed (with free()) if 'b' is resized or
  * freed. */
-void
+static void
 ofpbuf_use(struct ofpbuf *b, void *base, size_t allocated)
 {
-    ofpbuf_use__(b, base, allocated, OFPBUF_MALLOC);
+    ofpbuf_use__(b, base, allocated, 0, OFPBUF_MALLOC);
+}
+
+/* Converts ds into ofpbuf 'b'. 'b' contains the 'ds->allocated' bytes of
+ * memory starting at 'ds->string'.  'ds' should not be modified any more.
+ * The memory allocated for 'ds' will be freed (with free()) if 'b' is
+ * resized or freed. */
+void
+ofpbuf_use_ds(struct ofpbuf *b, const struct ds *ds)
+{
+    ofpbuf_use__(b, ds->string, ds->allocated + 1, ds->length, OFPBUF_MALLOC);
 }
 
 /* Initializes 'b' as an empty ofpbuf that contains the 'allocated' bytes of
@@ -70,7 +80,7 @@ ofpbuf_use(struct ofpbuf *b, void *base, size_t allocated)
 void
 ofpbuf_use_stack(struct ofpbuf *b, void *base, size_t allocated)
 {
-    ofpbuf_use__(b, base, allocated, OFPBUF_STACK);
+    ofpbuf_use__(b, base, allocated, 0, OFPBUF_STACK);
 }
 
 /* Initializes 'b' as an empty ofpbuf that contains the 'allocated' bytes of
@@ -90,7 +100,7 @@ ofpbuf_use_stack(struct ofpbuf *b, void *base, size_t allocated)
 void
 ofpbuf_use_stub(struct ofpbuf *b, void *base, size_t allocated)
 {
-    ofpbuf_use__(b, base, allocated, OFPBUF_STUB);
+    ofpbuf_use__(b, base, allocated, 0, OFPBUF_STUB);
 }
 
 /* Initializes 'b' as an ofpbuf whose data starts at 'data' and continues for
@@ -103,8 +113,7 @@ ofpbuf_use_stub(struct ofpbuf *b, void *base, size_t allocated)
 void
 ofpbuf_use_const(struct ofpbuf *b, const void *data, size_t size)
 {
-    ofpbuf_use__(b, CONST_CAST(void *, data), size, OFPBUF_STACK);
-    b->size = size;
+    ofpbuf_use__(b, CONST_CAST(void *, data), size, size, OFPBUF_STACK);
 }
 
 /* Initializes 'b' as an empty ofpbuf with an initial capacity of 'size'
@@ -166,20 +175,21 @@ ofpbuf_clone(const struct ofpbuf *buffer)
 /* Creates and returns a new ofpbuf whose data are copied from 'buffer'.   The
  * returned ofpbuf will additionally have 'headroom' bytes of headroom. */
 struct ofpbuf *
-ofpbuf_clone_with_headroom(const struct ofpbuf *buffer, size_t headroom)
+ofpbuf_clone_with_headroom(const struct ofpbuf *b, size_t headroom)
 {
     struct ofpbuf *new_buffer;
 
-    new_buffer = ofpbuf_clone_data_with_headroom(buffer->data,
-                                                 buffer->size,
-                                                 headroom);
-    if (buffer->header) {
-        uintptr_t data_delta
-            = (char *)new_buffer->data - (char *)buffer->data;
+    new_buffer = ofpbuf_clone_data_with_headroom(b->data, b->size, headroom);
+    if (b->header) {
+        ptrdiff_t header_offset = (char *) b->header - (char *) b->data;
 
-        new_buffer->header = (char *) buffer->header + data_delta;
+        new_buffer->header = (char *) new_buffer->data + header_offset;
     }
-    new_buffer->msg = buffer->msg;
+    if (b->msg) {
+        ptrdiff_t msg_offset = (char *) b->msg - (char *) b->data;
+
+        new_buffer->msg = (char *) new_buffer->data + msg_offset;
+    }
 
     return new_buffer;
 }
@@ -258,14 +268,14 @@ ofpbuf_resize__(struct ofpbuf *b, size_t new_headroom, size_t new_tailroom)
     new_data = (char *) new_base + new_headroom;
     if (b->data != new_data) {
         if (b->header) {
-            uintptr_t data_delta = (char *) b->header - (char *) b->data;
+            ptrdiff_t header_offset = (char *) b->header - (char *) b->data;
 
-            b->header = (char *) new_data + data_delta;
+            b->header = (char *) new_data + header_offset;
         }
         if (b->msg) {
-            uintptr_t data_delta = (char *) b->msg - (char *) b->data;
+            ptrdiff_t msg_offset = (char *) b->msg - (char *) b->data;
 
-            b->msg = (char *) new_data + data_delta;
+            b->msg = (char *) new_data + msg_offset;
         }
         b->data = new_data;
     }
@@ -365,7 +375,7 @@ void *
 ofpbuf_put_zeros(struct ofpbuf *b, size_t size)
 {
     void *dst = ofpbuf_put_uninit(b, size);
-    memset(dst, 0, size);
+    nullable_memset(dst, 0, size);
     return dst;
 }
 
@@ -380,10 +390,10 @@ ofpbuf_put(struct ofpbuf *b, const void *p, size_t size)
     return dst;
 }
 
-/* Parses as many pairs of hex digits as possible (possibly separated by
- * spaces) from the beginning of 's', appending bytes for their values to 'b'.
- * Returns the first character of 's' that is not the first of a pair of hex
- * digits.  If 'n' is nonnull, stores the number of bytes added to 'b' in
+/* Parses as many pairs of hex digits as possible (possibly separated by spaces
+ * or periods) from the beginning of 's', appending bytes for their values to
+ * 'b'.  Returns the first character of 's' that is not the first of a pair of
+ * hex digits.  If 'n' is nonnull, stores the number of bytes added to 'b' in
  * '*n'. */
 char *
 ofpbuf_put_hex(struct ofpbuf *b, const char *s, size_t *n)
@@ -393,7 +403,7 @@ ofpbuf_put_hex(struct ofpbuf *b, const char *s, size_t *n)
         uint8_t byte;
         bool ok;
 
-        s += strspn(s, " \t\r\n");
+        s += strspn(s, " .\t\r\n");
         byte = hexits_value(s, 2, &ok);
         if (!ok) {
             if (n) {
@@ -449,6 +459,24 @@ ofpbuf_push(struct ofpbuf *b, const void *p, size_t size)
     void *dst = ofpbuf_push_uninit(b, size);
     memcpy(dst, p, size);
     return dst;
+}
+
+/* Inserts the 'n' bytes of 'data' into 'b' starting at the given 'offset',
+ * moving data forward as necessary to make room.
+ *
+ * 'data' must not point inside 'b'. */
+void
+ofpbuf_insert(struct ofpbuf *b, size_t offset, const void *data, size_t n)
+{
+    if (offset < b->size) {
+        ofpbuf_put_uninit(b, n);
+        memmove((char *) b->data + offset + n, (char *) b->data + offset,
+                b->size - offset);
+        memcpy((char *) b->data + offset, data, n);
+    } else {
+        ovs_assert(offset == b->size);
+        ofpbuf_put(b, data, n);
+    }
 }
 
 /* Returns the data in 'b' as a block of malloc()'d memory and frees the buffer

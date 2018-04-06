@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 Nicira, Inc.
+ * Copyright (c) 2014, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -259,10 +259,10 @@ free_sockaddr_un(int dirfd, const char *linkname)
 }
 
 /* Binds Unix domain socket 'fd' to a file with permissions 0700. */
-static int
-bind_unix_socket(int fd, struct sockaddr *sun, socklen_t sun_len)
+static int bind_unix_socket(int fd, struct sockaddr *sun, socklen_t sun_len)
 {
-    const mode_t mode = 0700;
+    const mode_t mode = 0770;    /* Allow both user and group access. */
+
     if (LINUX) {
         /* On Linux, the fd's permissions become the file's permissions.
          * fchmod() does not affect other files, like umask() does. */
@@ -387,9 +387,10 @@ error:
 }
 
 int
-get_unix_name_len(socklen_t sun_len)
+get_unix_name_len(const struct sockaddr_un *sun, socklen_t sun_len)
 {
-    return (sun_len >= offsetof(struct sockaddr_un, sun_path)
+    return (sun_len > offsetof(struct sockaddr_un, sun_path) &&
+            sun->sun_path[0] != 0
             ? sun_len - offsetof(struct sockaddr_un, sun_path)
             : 0);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 VMware, Inc.
+ * Copyright (c) 2014, 2016 VMware, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -77,17 +77,19 @@
  */
 
 #include "precomp.h"
+#include "Debug.h"
+#include "Flow.h"
+#include "Offload.h"
+#include "NetProto.h"
+#include "PacketParser.h"
 #include "Switch.h"
+#include "Vport.h"
 
 #ifdef OVS_DBG_MOD
 #undef OVS_DBG_MOD
 #endif
 #define OVS_DBG_MOD OVS_DBG_BUFMGMT
-#include "Debug.h"
-#include "NetProto.h"
-#include "Flow.h"
-#include "Checksum.h"
-#include "PacketParser.h"
+
 
 /*
  * --------------------------------------------------------------------------
@@ -264,12 +266,14 @@ OvsInitNBLContext(POVS_BUFFER_CONTEXT ctx,
     ctx->flags = flags;
     ctx->srcPortNo = srcPortNo;
     ctx->origDataLength = origDataLength;
+    ctx->mru = 0;
 }
 
 
 static VOID
 OvsDumpForwardingDetails(PNET_BUFFER_LIST nbl)
 {
+#if OVS_DBG_DEFAULT >= OVS_DBG_LOUD
     PNDIS_SWITCH_FORWARDING_DETAIL_NET_BUFFER_LIST_INFO info;
     info = NET_BUFFER_LIST_SWITCH_FORWARDING_DETAIL(nbl);
     if (info == NULL) {
@@ -281,12 +285,15 @@ OvsDumpForwardingDetails(PNET_BUFFER_LIST nbl)
                  info->SourceNicIndex,
                  info->IsPacketDataSafe ? "TRUE" : "FALSE",
                  info->IsPacketDataSafe ? 0 : info->SafePacketDataSize);
-
+#else
+    UNREFERENCED_PARAMETER(nbl);
+#endif
 }
 
 static VOID
 OvsDumpNBLContext(PNET_BUFFER_LIST nbl)
 {
+#if OVS_DBG_DEFAULT >= OVS_DBG_LOUD
     PNET_BUFFER_LIST_CONTEXT ctx = nbl->Context;
     if (ctx == NULL) {
         OVS_LOG_INFO("No Net Buffer List context");
@@ -297,6 +304,9 @@ OvsDumpNBLContext(PNET_BUFFER_LIST nbl)
                      nbl, ctx, ctx->Size, ctx->Offset);
         ctx = ctx->Next;
     }
+#else
+    UNREFERENCED_PARAMETER(nbl);
+#endif
 }
 
 
@@ -334,6 +344,7 @@ OvsDumpNetBuffer(PNET_BUFFER nb)
 static VOID
 OvsDumpNetBufferList(PNET_BUFFER_LIST nbl)
 {
+#if OVS_DBG_DEFAULT >= OVS_DBG_LOUD
     PNET_BUFFER nb;
     OVS_LOG_INFO("NBL: %p, parent: %p, SrcHandle: %p, ChildCount:%d "
                  "poolHandle: %p",
@@ -346,6 +357,9 @@ OvsDumpNetBufferList(PNET_BUFFER_LIST nbl)
         OvsDumpNetBuffer(nb);
         nb = NET_BUFFER_NEXT_NB(nb);
     }
+#else
+    UNREFERENCED_PARAMETER(nbl);
+#endif
 }
 
 /*
@@ -418,7 +432,7 @@ OvsAllocateFixSizeNBL(PVOID ovsContext,
 
     OvsInitNBLContext(ctx, OVS_BUFFER_FROM_FIX_SIZE_POOL |
                       OVS_BUFFER_PRIVATE_FORWARD_CONTEXT, size,
-                      OVS_DEFAULT_PORT_NO);
+                      OVS_DPPORT_NUMBER_INVALID);
     line = __LINE__;
 allocate_done:
     OVS_LOG_LOUD("Allocate Fix NBL: %p, line: %d", nbl, line);
@@ -531,7 +545,7 @@ OvsAllocateVariableSizeNBL(PVOID ovsContext,
     OvsInitNBLContext(ctx, OVS_BUFFER_PRIVATE_MDL | OVS_BUFFER_PRIVATE_DATA |
                            OVS_BUFFER_PRIVATE_FORWARD_CONTEXT |
                            OVS_BUFFER_FROM_ZERO_SIZE_POOL,
-                      size, OVS_DEFAULT_PORT_NO);
+                           size, OVS_DPPORT_NUMBER_INVALID);
 
     OVS_LOG_LOUD("Allocate variable size NBL: %p", nbl);
     return nbl;
@@ -583,7 +597,8 @@ OvsInitExternalNBLContext(PVOID ovsContext,
      * we use first nb to decide whether we need advance or retreat during
      * complete.
      */
-    OvsInitNBLContext(ctx, flags, NET_BUFFER_DATA_LENGTH(nb), OVS_DEFAULT_PORT_NO);
+    OvsInitNBLContext(ctx, flags, NET_BUFFER_DATA_LENGTH(nb),
+                      OVS_DPPORT_NUMBER_INVALID);
     return ctx;
 }
 
@@ -798,8 +813,9 @@ OvsPartialCopyNBL(PVOID ovsContext,
              OVS_BUFFER_PRIVATE_FORWARD_CONTEXT;
 
     srcNb = NET_BUFFER_LIST_FIRST_NB(nbl);
+    ASSERT(srcNb);
     OvsInitNBLContext(dstCtx, flags, NET_BUFFER_DATA_LENGTH(srcNb) - copySize,
-                      OVS_DEFAULT_PORT_NO);
+                      OVS_DPPORT_NUMBER_INVALID);
 
     InterlockedIncrement((LONG volatile *)&srcCtx->refCount);
 
@@ -980,6 +996,9 @@ OvsFullCopyNBL(PVOID ovsContext,
     }
 
     nb = NET_BUFFER_LIST_FIRST_NB(nbl);
+    if (nb == NULL) {
+        return NULL;
+    }
 
     if (NET_BUFFER_NEXT_NB(nb) == NULL) {
         return OvsCopySinglePacketNBL(context, nbl, nb, headRoom, copyNblInfo);
@@ -1053,7 +1072,7 @@ OvsFullCopyNBL(PVOID ovsContext,
              OVS_BUFFER_PRIVATE_FORWARD_CONTEXT;
 
     OvsInitNBLContext(dstCtx, flags, NET_BUFFER_DATA_LENGTH(firstNb),
-                      OVS_DEFAULT_PORT_NO);
+                      OVS_DPPORT_NUMBER_INVALID);
 
 #ifdef DBG
     OvsDumpNetBufferList(nbl);
@@ -1078,6 +1097,31 @@ nblcopy_error:
     NdisFreeNetBufferList(newNbl);
     OVS_LOG_ERROR("OvsFullCopyNBL failed");
     return NULL;
+}
+
+NDIS_STATUS
+GetIpHeaderInfo(PNET_BUFFER_LIST curNbl,
+                UINT32 *hdrSize)
+{
+    CHAR *ethBuf[sizeof(EthHdr)];
+    EthHdr *eth;
+    IPHdr *ipHdr;
+    PNET_BUFFER curNb;
+
+    curNb = NET_BUFFER_LIST_FIRST_NB(curNbl);
+    ASSERT(NET_BUFFER_NEXT_NB(curNb) == NULL);
+
+    eth = (EthHdr *)NdisGetDataBuffer(curNb, ETH_HEADER_LENGTH,
+                                      (PVOID)&ethBuf, 1, 0);
+    if (eth == NULL) {
+        return NDIS_STATUS_INVALID_PACKET;
+    }
+    ipHdr = (IPHdr *)((PCHAR)eth + ETH_HEADER_LENGTH);
+    if (ipHdr == NULL) {
+        return NDIS_STATUS_INVALID_PACKET;
+    }
+    *hdrSize = (UINT32)(ETH_HEADER_LENGTH + (ipHdr->ihl * 4));
+    return NDIS_STATUS_SUCCESS;
 }
 
 /*
@@ -1106,6 +1150,62 @@ GetSegmentHeaderInfo(PNET_BUFFER_LIST nbl,
     return NDIS_STATUS_SUCCESS;
 }
 
+/*
+ * --------------------------------------------------------------------------
+ * FixFragmentHeader
+ *
+ *    Fix IP length, Offset, IP checksum.
+ *    XXX - Support IpV6 Fragments
+ * --------------------------------------------------------------------------
+ */
+static NDIS_STATUS
+FixFragmentHeader(PNET_BUFFER nb, UINT16 fragmentSize,
+                  BOOLEAN lastPacket, UINT16 offset)
+{
+    EthHdr *dstEth = NULL;
+    PMDL mdl = NULL;
+    PUINT8 bufferStart = NULL;
+
+    mdl = NET_BUFFER_FIRST_MDL(nb);
+
+    bufferStart = (PUINT8)OvsGetMdlWithLowPriority(mdl);
+    if (!bufferStart) {
+        return NDIS_STATUS_RESOURCES;
+    }
+    dstEth = (EthHdr *)(bufferStart + NET_BUFFER_CURRENT_MDL_OFFSET(nb));
+
+    switch (dstEth->Type) {
+    case ETH_TYPE_IPV4_NBO:
+    {
+        IPHdr *dstIP = NULL;
+        ASSERT((INT)MmGetMdlByteCount(mdl) - NET_BUFFER_CURRENT_MDL_OFFSET(nb)
+            >= sizeof(EthHdr) + sizeof(IPHdr));
+
+        dstIP = (IPHdr *)((PCHAR)dstEth + sizeof(*dstEth));
+        ASSERT((INT)MmGetMdlByteCount(mdl) - NET_BUFFER_CURRENT_MDL_OFFSET(nb)
+            >= sizeof(EthHdr) + dstIP->ihl * 4);
+        dstIP->tot_len = htons(fragmentSize + dstIP->ihl * 4);
+        if (lastPacket) {
+            dstIP->frag_off = htons(offset & IP_OFFSET);
+        } else {
+            dstIP->frag_off = htons((offset & IP_OFFSET) | IP_MF);
+        }
+
+        dstIP->check = 0;
+        dstIP->check = IPChecksum((UINT8 *)dstIP, dstIP->ihl * 4, 0);
+        break;
+    }
+    case ETH_TYPE_IPV6_NBO:
+    {
+        return NDIS_STATUS_NOT_SUPPORTED;
+    }
+    default:
+        OVS_LOG_ERROR("Invalid eth type: %d\n", dstEth->Type);
+        ASSERT(! "Invalid eth type");
+    }
+
+    return STATUS_SUCCESS;
+}
 
 /*
  * --------------------------------------------------------------------------
@@ -1116,51 +1216,126 @@ GetSegmentHeaderInfo(PNET_BUFFER_LIST nbl,
  * --------------------------------------------------------------------------
  */
 static NDIS_STATUS
-FixSegmentHeader(PNET_BUFFER nb, UINT16 segmentSize, UINT32 seqNumber)
+FixSegmentHeader(PNET_BUFFER nb, UINT16 segmentSize, UINT32 seqNumber,
+                 BOOLEAN lastPacket, UINT16 packetCounter)
 {
-    EthHdr *dstEth;
-    IPHdr *dstIP;
-    TCPHdr *dstTCP;
-    PMDL mdl;
-    PUINT8 bufferStart;
+    EthHdr *dstEth = NULL;
+    TCPHdr *dstTCP = NULL;
+    PMDL mdl = NULL;
+    PUINT8 bufferStart = NULL;
 
     mdl = NET_BUFFER_FIRST_MDL(nb);
 
-    bufferStart = (PUINT8)MmGetSystemAddressForMdlSafe(mdl, LowPagePriority);
+    bufferStart = (PUINT8)OvsGetMdlWithLowPriority(mdl);
     if (!bufferStart) {
         return NDIS_STATUS_RESOURCES;
     }
     dstEth = (EthHdr *)(bufferStart + NET_BUFFER_CURRENT_MDL_OFFSET(nb));
-    ASSERT((INT)MmGetMdlByteCount(mdl) - NET_BUFFER_CURRENT_MDL_OFFSET(nb)
-            >= sizeof(EthHdr) + sizeof(IPHdr) + sizeof(TCPHdr));
-    dstIP = (IPHdr *)((PCHAR)dstEth + sizeof *dstEth);
-    dstTCP = (TCPHdr *)((PCHAR)dstIP + dstIP->ihl * 4);
-    ASSERT((INT)MmGetMdlByteCount(mdl) - NET_BUFFER_CURRENT_MDL_OFFSET(nb)
-            >= sizeof(EthHdr) + dstIP->ihl * 4 + TCP_HDR_LEN(dstTCP));
 
-    /* Fix IP length and checksum */
-    ASSERT(dstIP->protocol == IPPROTO_TCP);
-    dstIP->tot_len = htons(segmentSize + dstIP->ihl * 4 + TCP_HDR_LEN(dstTCP));
-    dstIP->check = 0;
-    dstIP->check = IPChecksum((UINT8 *)dstIP, dstIP->ihl * 4, 0);
+    switch (dstEth->Type) {
+    case ETH_TYPE_IPV4_NBO:
+    {
+        IPHdr *dstIP = NULL;
 
-    /* Fix TCP checksum */
-    dstTCP->seq = htonl(seqNumber);
-    dstTCP->check =
-        IPPseudoChecksum((UINT32 *)&dstIP->saddr,
-                         (UINT32 *)&dstIP->daddr,
-                         IPPROTO_TCP, segmentSize + TCP_HDR_LEN(dstTCP));
-    dstTCP->check = CalculateChecksumNB(nb,
-            (UINT16)(NET_BUFFER_DATA_LENGTH(nb) - sizeof *dstEth - dstIP->ihl * 4),
-            sizeof *dstEth + dstIP->ihl * 4);
+        ASSERT((INT)MmGetMdlByteCount(mdl) - NET_BUFFER_CURRENT_MDL_OFFSET(nb)
+                >= sizeof(EthHdr) + sizeof(IPHdr) + sizeof(TCPHdr));
+        dstIP = (IPHdr *)((PCHAR)dstEth + sizeof(*dstEth));
+        dstTCP = (TCPHdr *)((PCHAR)dstIP + dstIP->ihl * 4);
+        ASSERT((INT)MmGetMdlByteCount(mdl) - NET_BUFFER_CURRENT_MDL_OFFSET(nb)
+                >= sizeof(EthHdr) + dstIP->ihl * 4 + TCP_HDR_LEN(dstTCP));
+
+        /* Fix IP length and checksum */
+        ASSERT(dstIP->protocol == IPPROTO_TCP);
+        dstIP->tot_len = htons(segmentSize + dstIP->ihl * 4 + TCP_HDR_LEN(dstTCP));
+        dstIP->id += packetCounter;
+        dstIP->check = 0;
+        dstIP->check = IPChecksum((UINT8 *)dstIP, dstIP->ihl * 4, 0);
+        dstTCP->seq = htonl(seqNumber);
+
+        /*
+         * Set the TCP FIN and PSH bit only for the last packet
+         * More information can be found under:
+         * https://msdn.microsoft.com/en-us/library/windows/hardware/ff568840%28v=vs.85%29.aspx
+         */
+        if (dstTCP->fin) {
+            dstTCP->fin = lastPacket;
+        }
+        if (dstTCP->psh) {
+            dstTCP->psh = lastPacket;
+        }
+        UINT16 csumLength = segmentSize + TCP_HDR_LEN(dstTCP);
+        dstTCP->check = IPPseudoChecksum(&dstIP->saddr,
+                                         &dstIP->daddr,
+                                         IPPROTO_TCP,
+                                         csumLength);
+        dstTCP->check = CalculateChecksumNB(nb,
+                                            csumLength,
+                                            sizeof(*dstEth) + dstIP->ihl * 4);
+        break;
+    }
+    case ETH_TYPE_IPV6_NBO:
+    {
+        IPv6Hdr *dstIP = NULL;
+
+        ASSERT((INT)MmGetMdlByteCount(mdl) - NET_BUFFER_CURRENT_MDL_OFFSET(nb)
+            >= sizeof(EthHdr) + sizeof(IPv6Hdr) + sizeof(TCPHdr));
+        dstIP = (IPv6Hdr *)((PCHAR)dstEth + sizeof(*dstEth));
+        dstTCP = (TCPHdr *)((PCHAR)dstIP + sizeof(IPv6Hdr));
+        ASSERT((INT)MmGetMdlByteCount(mdl) - NET_BUFFER_CURRENT_MDL_OFFSET(nb)
+            >= sizeof(EthHdr) + sizeof(IPv6Hdr) + TCP_HDR_LEN(dstTCP));
+
+        /* Fix IP length */
+        ASSERT(dstIP->nexthdr == IPPROTO_TCP);
+        dstIP->payload_len = htons(segmentSize + sizeof(IPv6Hdr) + TCP_HDR_LEN(dstTCP));
+
+        dstTCP->seq = htonl(seqNumber);
+        if (dstTCP->fin) {
+            dstTCP->fin = lastPacket;
+        }
+        if (dstTCP->psh) {
+            dstTCP->psh = lastPacket;
+        }
+
+        UINT16 csumLength = segmentSize + TCP_HDR_LEN(dstTCP);
+        dstTCP->check = IPv6PseudoChecksum((UINT32*)&dstIP->saddr,
+                                           (UINT32*)&dstIP->daddr,
+                                           IPPROTO_TCP,
+                                           csumLength);
+        dstTCP->check = CalculateChecksumNB(nb,
+                                            csumLength,
+                                            sizeof(*dstEth) + sizeof(IPv6Hdr));
+        break;
+    }
+    default:
+        OVS_LOG_ERROR("Invalid eth type: %d\n", dstEth->Type);
+        ASSERT(! "Invalid eth type");
+    }
+
     return STATUS_SUCCESS;
 }
+ /*
+  * --------------------------------------------------------------------------
+ * OvsTcpSegmentNBL --
+ *    Wrapper function to Fragment a given NBL based on MSS
+ * --------------------------------------------------------------------------
+ */
+PNET_BUFFER_LIST
+OvsTcpSegmentNBL(PVOID ovsContext,
+                 PNET_BUFFER_LIST nbl,
+                 POVS_PACKET_HDR_INFO hdrInfo,
+                 UINT32 mss,
+                 UINT32 headRoom,
+                 BOOLEAN isIpFragment)
+{
+    return OvsFragmentNBL(ovsContext, nbl, hdrInfo, mss, headRoom, isIpFragment);
+}
+
 
 /*
  * --------------------------------------------------------------------------
- * OvsTcpSegmentyNBL --
+ * OvsFragmentNBL --
  *
- *    Segment TCP payload, and prepend each segment with ether/IP/TCP header.
+ *    Fragment NBL payload, and prepend each segment with Ether/IP/TCP header.
  *    Leave headRoom for additional encap.
  *
  *    Please note,
@@ -1173,23 +1348,25 @@ FixSegmentHeader(PNET_BUFFER nb, UINT16 segmentSize, UINT32 seqNumber)
  * --------------------------------------------------------------------------
  */
 PNET_BUFFER_LIST
-OvsTcpSegmentNBL(PVOID ovsContext,
-                 PNET_BUFFER_LIST nbl,
-                 POVS_PACKET_HDR_INFO hdrInfo,
-                 UINT32 mss,
-                 UINT32 headRoom)
+OvsFragmentNBL(PVOID ovsContext,
+               PNET_BUFFER_LIST nbl,
+               POVS_PACKET_HDR_INFO hdrInfo,
+               UINT32 fragmentSize,
+               UINT32 headRoom,
+               BOOLEAN isIpFragment)
 {
     POVS_SWITCH_CONTEXT context = (POVS_SWITCH_CONTEXT)ovsContext;
 #ifdef DBG
     POVS_NBL_POOL ovsPool = &context->ovsPool;
 #endif
     POVS_BUFFER_CONTEXT dstCtx, srcCtx;
-    UINT32 size, hdrSize, seqNumber;
+    UINT32 size, hdrSize, nblSize, seqNumber = 0;
     PNET_BUFFER_LIST newNbl;
     PNET_BUFFER nb, newNb;
     NDIS_STATUS status;
     UINT16 segmentSize;
     ULONG copiedSize;
+    UINT16 offset = 0, packetCounter = 0;
 
     srcCtx = (POVS_BUFFER_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
     if (srcCtx == NULL || srcCtx->magic != OVS_CTX_MAGIC) {
@@ -1201,18 +1378,28 @@ OvsTcpSegmentNBL(PVOID ovsContext,
     nb = NET_BUFFER_LIST_FIRST_NB(nbl);
     ASSERT(NET_BUFFER_NEXT_NB(nb) == NULL);
 
-    /* Figure out the segment header size */
-    status = GetSegmentHeaderInfo(nbl, hdrInfo, &hdrSize, &seqNumber);
+    /* Figure out the header size */
+    if (isIpFragment) {
+        status = GetIpHeaderInfo(nbl, &hdrSize);
+    } else {
+        status = GetSegmentHeaderInfo(nbl, hdrInfo, &hdrSize, &seqNumber);
+    }
     if (status != NDIS_STATUS_SUCCESS) {
         OVS_LOG_INFO("Cannot parse NBL header");
         return NULL;
     }
-
+    /* Get the NBL size. */
+    if (isIpFragment) {
+        nblSize = fragmentSize - hdrSize;
+    } else {
+        nblSize = fragmentSize;
+    }
     size = NET_BUFFER_DATA_LENGTH(nb) - hdrSize;
 
     /* XXX add to ovsPool counters? */
-    newNbl = NdisAllocateFragmentNetBufferList(nbl, NULL,
-            NULL, hdrSize, mss, hdrSize + headRoom , 0, 0);
+    newNbl = NdisAllocateFragmentNetBufferList(nbl, NULL, NULL, hdrSize,
+                                               nblSize, hdrSize + headRoom ,
+                                               0, 0);
     if (newNbl == NULL) {
         return NULL;
     }
@@ -1220,7 +1407,7 @@ OvsTcpSegmentNBL(PVOID ovsContext,
     /* Now deal with TCP payload */
     for (newNb = NET_BUFFER_LIST_FIRST_NB(newNbl); newNb != NULL;
             newNb = NET_BUFFER_NEXT_NB(newNb)) {
-        segmentSize = (size > mss ? mss : size) & 0xffff;
+        segmentSize = (size > nblSize ? nblSize : size) & 0xffff;
         if (headRoom) {
             NdisAdvanceNetBufferDataStart(newNb, headRoom, FALSE, NULL);
         }
@@ -1232,15 +1419,28 @@ OvsTcpSegmentNBL(PVOID ovsContext,
             goto nblcopy_error;
         }
 
-        status = FixSegmentHeader(newNb, segmentSize, seqNumber);
+        if (isIpFragment) {
+            status = FixFragmentHeader(newNb, segmentSize,
+                                       NET_BUFFER_NEXT_NB(newNb) == NULL,
+                                       offset);
+        } else {
+            status = FixSegmentHeader(newNb, segmentSize, seqNumber,
+                                      NET_BUFFER_NEXT_NB(newNb) == NULL,
+                                      packetCounter);
+        }
+
         if (status != NDIS_STATUS_SUCCESS) {
             goto nblcopy_error;
         }
 
-
         /* Move on to the next segment */
+        if (isIpFragment) {
+            offset += (segmentSize) / 8;
+        } else {
+            seqNumber += segmentSize;
+        }
         size -= segmentSize;
-        seqNumber += segmentSize;
+        packetCounter++;
     }
 
     status = OvsAllocateNBLContext(context, newNbl);
@@ -1253,6 +1453,15 @@ OvsTcpSegmentNBL(PVOID ovsContext,
         goto nbl_context_error;
     }
 
+    if (isIpFragment) {
+    /*Copy with Flag - NDIS_SWITCH_COPY_NBL_INFO_FLAGS_PRESERVE_DESTINATIONS.*/
+        status = context->NdisSwitchHandlers.
+            CopyNetBufferListInfo(context->ovsPool.ndisContext, newNbl, nbl, 1);
+
+        if (status != NDIS_STATUS_SUCCESS) {
+            goto nbl_context_error;
+        }
+    }
     newNbl->ParentNetBufferList = nbl;
 
     /* Remember it's a fragment NBL so we can free it properly */
@@ -1263,6 +1472,7 @@ OvsTcpSegmentNBL(PVOID ovsContext,
     dstCtx->refCount = 1;
     dstCtx->magic = OVS_CTX_MAGIC;
     dstCtx->dataOffsetDelta = hdrSize + headRoom;
+    dstCtx->mru = 0;
 
     InterlockedIncrement((LONG volatile *)&srcCtx->refCount);
 #ifdef DBG
@@ -1274,7 +1484,7 @@ OvsTcpSegmentNBL(PVOID ovsContext,
     OvsDumpNetBufferList(newNbl);
     OvsDumpForwardingDetails(newNbl);
 #endif
-    OVS_LOG_TRACE("Segment nbl %p to newNbl: %p", nbl, newNbl);
+    OVS_LOG_TRACE("Fragment nbl %p to newNbl: %p", nbl, newNbl);
     return newNbl;
 
 nbl_context_error:
@@ -1287,6 +1497,52 @@ nblcopy_error:
     return NULL;
 }
 
+/*
+ * --------------------------------------------------------------------------
+ * OvsAllocateNBLFromBuffer --
+ *
+ * This function allocates all the stuff necessary for creating an NBL from the
+ * input buffer of specified length, namely, a nonpaged data buffer of size
+ * length, an MDL from it, and a NB and NBL from it. It does not allocate an NBL
+ * context yet. It also copies data from the specified buffer to the NBL.
+ * --------------------------------------------------------------------------
+ */
+PNET_BUFFER_LIST
+OvsAllocateNBLFromBuffer(PVOID context,
+                         PVOID buffer,
+                         ULONG length)
+{
+    POVS_SWITCH_CONTEXT switchContext = (POVS_SWITCH_CONTEXT)context;
+    UINT8 *data = NULL;
+    PNET_BUFFER_LIST nbl = NULL;
+    PNET_BUFFER nb;
+    PMDL mdl;
+
+    if (length > OVS_DEFAULT_DATA_SIZE) {
+        nbl = OvsAllocateVariableSizeNBL(switchContext, length,
+                                         OVS_DEFAULT_HEADROOM_SIZE);
+
+    } else {
+        nbl = OvsAllocateFixSizeNBL(switchContext, length,
+                                    OVS_DEFAULT_HEADROOM_SIZE);
+    }
+    if (nbl == NULL) {
+        return NULL;
+    }
+
+    nb = NET_BUFFER_LIST_FIRST_NB(nbl);
+    mdl = NET_BUFFER_CURRENT_MDL(nb);
+    data = (PUINT8)OvsGetMdlWithLowPriority(mdl)
+        + NET_BUFFER_CURRENT_MDL_OFFSET(nb);
+    if (!data) {
+        OvsCompleteNBL(switchContext, nbl, TRUE);
+        return NULL;
+    }
+
+    NdisMoveMemory(data, buffer, length);
+
+    return nbl;
+}
 
 /*
  * --------------------------------------------------------------------------
@@ -1360,7 +1616,7 @@ copymultiple_error:
  * --------------------------------------------------------------------------
  */
 PNET_BUFFER_LIST
-OvsCompleteNBL(POVS_SWITCH_CONTEXT context,
+OvsCompleteNBL(PVOID switch_ctx,
                PNET_BUFFER_LIST nbl,
                BOOLEAN updateRef)
 {
@@ -1370,6 +1626,7 @@ OvsCompleteNBL(POVS_SWITCH_CONTEXT context,
     NDIS_STATUS status;
     NDIS_HANDLE poolHandle;
     LONG value;
+    POVS_SWITCH_CONTEXT context = (POVS_SWITCH_CONTEXT)switch_ctx;
     POVS_NBL_POOL ovsPool = &context->ovsPool;
     PNET_BUFFER nb;
 
@@ -1430,27 +1687,29 @@ OvsCompleteNBL(POVS_SWITCH_CONTEXT context,
     }
 
     if (flags & (OVS_BUFFER_PRIVATE_MDL | OVS_BUFFER_PRIVATE_DATA)) {
-        PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(nbl);
-        while (nb) {
-            PMDL mdl = NET_BUFFER_FIRST_MDL(nb);
-            NET_BUFFER_FIRST_MDL(nb) = NULL;
-            ASSERT(mdl->Next == NULL);
-            OvsFreeMDLAndData(mdl);
-            nb = NET_BUFFER_NEXT_NB(nb);
+        PNET_BUFFER nbTemp = NET_BUFFER_LIST_FIRST_NB(nbl);
+        while (nbTemp) {
+            PMDL mdl = NET_BUFFER_FIRST_MDL(nbTemp);
+            if (mdl) {
+                ASSERT(mdl->Next == NULL);
+                OvsFreeMDLAndData(mdl);
+            }
+            NET_BUFFER_FIRST_MDL(nbTemp) = NULL;
+            nbTemp = NET_BUFFER_NEXT_NB(nbTemp);
         }
     }
 
     if (flags & OVS_BUFFER_PRIVATE_NET_BUFFER) {
-        PNET_BUFFER nb, nextNb;
+        PNET_BUFFER nbTemp, nextNb;
 
-        nb = NET_BUFFER_LIST_FIRST_NB(nbl);
-        while (nb) {
-            nextNb = NET_BUFFER_NEXT_NB(nb);
-            NdisFreeNetBuffer(nb);
+        nbTemp = NET_BUFFER_LIST_FIRST_NB(nbl);
+        while (nbTemp) {
+            nextNb = NET_BUFFER_NEXT_NB(nbTemp);
+            NdisFreeNetBuffer(nbTemp);
 #ifdef DBG
             InterlockedDecrement((LONG volatile *)&ovsPool->nbCount);
 #endif
-            nb = nextNb;
+            nbTemp = nextNb;
         }
         NET_BUFFER_LIST_FIRST_NB(nbl) = NULL;
     }
@@ -1535,4 +1794,51 @@ OvsGetCtxSourcePortNo(PNET_BUFFER_LIST nbl,
     }
     *portNo = ctx->srcPortNo;
     return NDIS_STATUS_SUCCESS;
+}
+
+/*
+ * --------------------------------------------------------------------------
+ * OvsCreateNewNBLsFromMultipleNBs --
+ *      Creates an NBL chain where each NBL has a single NB,
+ *      from an NBL which has multiple NBs.
+ *      Sets 'curNbl' and 'lastNbl' to the first and last NBL in the
+ *      newly created NBL chain respectively, and completes the original NBL.
+ * --------------------------------------------------------------------------
+ */
+NTSTATUS
+OvsCreateNewNBLsFromMultipleNBs(POVS_SWITCH_CONTEXT switchContext,
+                                PNET_BUFFER_LIST *curNbl,
+                                PNET_BUFFER_LIST *lastNbl)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    PNET_BUFFER_LIST newNbls = NULL;
+    PNET_BUFFER_LIST nbl = NULL;
+    BOOLEAN error = TRUE;
+
+    do {
+        /* Create new NBLs from curNbl with multiple net buffers. */
+        newNbls = OvsPartialCopyToMultipleNBLs(switchContext,
+                                               *curNbl, 0, 0, TRUE);
+        if (NULL == newNbls) {
+            OVS_LOG_ERROR("Failed to allocate NBLs with single NB.");
+            status = NDIS_STATUS_RESOURCES;
+            break;
+        }
+
+        nbl = newNbls;
+        while (nbl) {
+            *lastNbl = nbl;
+            nbl = NET_BUFFER_LIST_NEXT_NBL(nbl);
+        }
+
+        (*curNbl)->Next = NULL;
+
+        OvsCompleteNBL(switchContext, *curNbl, TRUE);
+
+        *curNbl = newNbls;
+
+        error = FALSE;
+    } while (error);
+
+    return status;
 }

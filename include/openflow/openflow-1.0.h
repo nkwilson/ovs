@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,11 @@
 #define OPENFLOW_OPENFLOW10_H 1
 
 #include <openflow/openflow-common.h>
+
+/* Maximum name of a port.
+ *
+ * OpenFlow 1.6 (draft) increases this to 64. */
+#define OFP10_MAX_PORT_NAME_LEN  16
 
 /* Port number(s)   meaning
  * ---------------  --------------------------------------
@@ -96,8 +101,8 @@ enum ofp10_port_features {
 /* Description of a physical port */
 struct ofp10_phy_port {
     ovs_be16 port_no;
-    uint8_t hw_addr[OFP_ETH_ALEN];
-    char name[OFP_MAX_PORT_NAME_LEN]; /* Null-terminated */
+    struct eth_addr hw_addr;
+    char name[OFP10_MAX_PORT_NAME_LEN]; /* Null-terminated */
 
     ovs_be32 config;        /* Bitmap of OFPPC_* and OFPPC10_* flags. */
     ovs_be32 state;         /* Bitmap of OFPPS_* and OFPPS10_* flags. */
@@ -114,11 +119,10 @@ OFP_ASSERT(sizeof(struct ofp10_phy_port) == 48);
 /* Modify behavior of the physical port */
 struct ofp10_port_mod {
     ovs_be16 port_no;
-    uint8_t hw_addr[OFP_ETH_ALEN]; /* The hardware address is not
-                                      configurable.  This is used to
-                                      sanity-check the request, so it must
-                                      be the same as returned in an
-                                      ofp10_phy_port struct. */
+    struct eth_addr hw_addr; /* The hardware address is not configurable.  This
+                                is used to sanity-check the request, so it must
+                                be the same as returned in an ofp10_phy_port
+                                struct. */
 
     ovs_be32 config;        /* Bitmap of OFPPC_* flags. */
     ovs_be32 mask;          /* Bitmap of OFPPC_* flags to be changed. */
@@ -137,6 +141,41 @@ struct ofp10_packet_queue {
      * ofp_queue_prop_header, to fill out a total of 'len' bytes. */
 };
 OFP_ASSERT(sizeof(struct ofp10_packet_queue) == 8);
+
+/* Queue properties for OF1.0 to OF1.3.
+ *
+ * OF1.4+ use the same numbers but rename them and change the property formats
+ * in incompatible ways, so there's not much benefit to sharing the names. */
+enum ofp10_queue_properties {
+    /* Introduced in OF1.0. */
+    OFPQT10_MIN_RATE = 1,          /* Minimum datarate guaranteed. */
+
+    /* Introduced in OF1.1. */
+    OFPQT11_MAX_RATE = 2,          /* Maximum guaranteed rate. */
+    OFPQT11_EXPERIMENTER = 0xffff, /* Experimenter defined property. */
+};
+
+/* Description for a queue in OpenFlow 1.0 to 1.3.
+ *
+ * OF1.4+ also use a TLV format but an incompatible one. */
+struct ofp10_queue_prop_header {
+    ovs_be16 property; /* One of OFPQT*. */
+    ovs_be16 len;      /* Length of property, including this header. */
+    uint8_t pad[4];    /* 64-bit alignemnt. */
+};
+OFP_ASSERT(sizeof(struct ofp10_queue_prop_header) == 8);
+
+/* Min-Rate and Max-Rate queue property description (OFPQT10_MIN and
+ * OFPQT11_MAX).
+ *
+ * OF1.4+ use similar TLVs but they are incompatible due to different padding.
+ */
+struct ofp10_queue_prop_rate {
+    struct ofp10_queue_prop_header prop_header;
+    ovs_be16 rate;        /* In 1/10 of a percent; >1000 -> disabled. */
+    uint8_t pad[6];       /* 64-bit alignment */
+};
+OFP_ASSERT(sizeof(struct ofp10_queue_prop_rate) == 16);
 
 /* Query for port queue configuration. */
 struct ofp10_queue_get_config_request {
@@ -234,8 +273,8 @@ enum ofp10_flow_wildcards {
 struct ofp10_match {
     ovs_be32 wildcards;        /* Wildcard fields. */
     ovs_be16 in_port;          /* Input switch port. */
-    uint8_t dl_src[OFP_ETH_ALEN]; /* Ethernet source address. */
-    uint8_t dl_dst[OFP_ETH_ALEN]; /* Ethernet destination address. */
+    struct eth_addr dl_src;    /* Ethernet source address. */
+    struct eth_addr dl_dst;    /* Ethernet destination address. */
     ovs_be16 dl_vlan;          /* Input VLAN. */
     uint8_t dl_vlan_pcp;       /* Input VLAN priority. */
     uint8_t pad1[1];           /* Align to 64-bits. */
@@ -296,15 +335,6 @@ struct ofp10_flow_removed {
     ovs_be64 byte_count;
 };
 OFP_ASSERT(sizeof(struct ofp10_flow_removed) == 80);
-
-/* Statistics request or reply message. */
-struct ofp10_stats_msg {
-    struct ofp_header header;
-    ovs_be16 type;              /* One of the OFPST_* constants. */
-    ovs_be16 flags;             /* Requests: always 0.
-                                 * Replies: 0 or OFPSF_REPLY_MORE. */
-};
-OFP_ASSERT(sizeof(struct ofp10_stats_msg) == 12);
 
 /* Stats request of type OFPST_AGGREGATE or OFPST_FLOW. */
 struct ofp10_flow_stats_request {
@@ -409,16 +439,5 @@ struct ofp10_queue_stats {
     ovs_32aligned_be64 tx_errors;  /* # of packets dropped due to overrun. */
 };
 OFP_ASSERT(sizeof(struct ofp10_queue_stats) == 32);
-
-/* Vendor extension stats message. */
-struct ofp10_vendor_stats_msg {
-    struct ofp10_stats_msg osm; /* Type OFPST_VENDOR. */
-    ovs_be32 vendor;            /* Vendor ID:
-                                 * - MSB 0: low-order bytes are IEEE OUI.
-                                 * - MSB != 0: defined by OpenFlow
-                                 *   consortium. */
-    /* Followed by vendor-defined arbitrary additional data. */
-};
-OFP_ASSERT(sizeof(struct ofp10_vendor_stats_msg) == 16);
 
 #endif /* openflow/openflow-1.0.h */

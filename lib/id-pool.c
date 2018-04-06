@@ -17,7 +17,7 @@
 
 #include <config.h>
 #include "id-pool.h"
-#include "hmap.h"
+#include "openvswitch/hmap.h"
 #include "hash.h"
 
 struct id_node {
@@ -69,10 +69,9 @@ id_pool_init(struct id_pool *pool, uint32_t base, uint32_t n_ids)
 static void
 id_pool_uninit(struct id_pool *pool)
 {
-    struct id_node *id_node, *next;
+    struct id_node *id_node;
 
-    HMAP_FOR_EACH_SAFE(id_node, next, node, &pool->map) {
-        hmap_remove(&pool->map, &id_node->node);
+    HMAP_FOR_EACH_POP(id_node, node, &pool->map) {
         free(id_node);
     }
 
@@ -131,7 +130,7 @@ id_pool_alloc_id(struct id_pool *pool, uint32_t *id_)
 found_free_id:
     id_pool_add(pool, id);
 
-    if (id < pool->base + pool->n_ids) {
+    if (id + 1 < pool->base + pool->n_ids) {
         pool->next_free_id = id + 1;
     } else {
         pool->next_free_id = pool->base;
@@ -145,10 +144,13 @@ void
 id_pool_free_id(struct id_pool *pool, uint32_t id)
 {
     struct id_node *id_node;
-    if (id > pool->base && (id <= pool->base + pool->n_ids)) {
+    if (id >= pool->base && (id < pool->base + pool->n_ids)) {
         id_node = id_pool_find(pool, id);
         if (id_node) {
             hmap_remove(&pool->map, &id_node->node);
+            if (id < pool->next_free_id) {
+                pool->next_free_id = id;
+            }
             free(id_node);
         }
     }

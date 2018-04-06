@@ -8,7 +8,7 @@ MA_DIR ?= /usr/share/modass
 DATAPATH_CONFIGURE_OPTS =
 
 kdist_clean:
-	dh_testdir	
+	dh_testdir
 	dh_testroot
 	dh_clean
 	rm -rf openvswitch
@@ -17,7 +17,7 @@ kdist_clean:
 kdist_config: prep-deb-files
 
 .PHONY: binary-modules
-binary-modules: DSTDIR = $(CURDIR)/debian/$(PKGNAME)/lib/modules/$(KVERS)/kernel/updates
+binary-modules: DSTDIR = $(CURDIR)/debian/$(PKGNAME)/lib/modules/$(KVERS)/updates
 binary-modules: prep-deb-files
 	dh_testdir
 	dh_testroot

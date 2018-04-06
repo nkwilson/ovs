@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import codecs
 import errno
 import os
+import sys
 
 import ovs.json
 import ovs.poller
@@ -22,6 +23,8 @@ import ovs.stream
 import ovs.timeval
 import ovs.util
 import ovs.vlog
+
+import six
 
 EOF = ovs.util.EOF
 vlog = ovs.vlog.Vlog("jsonrpc")
@@ -88,13 +91,13 @@ class Message(object):
             return "%s %s have \"%s\"" % (type_name, verb, name)
 
     def is_valid(self):
-        if self.params is not None and type(self.params) != list:
+        if self.params is not None and not isinstance(self.params, list):
             return "\"params\" must be JSON array"
 
         pattern = {Message.T_REQUEST: 0x11001,
-                   Message.T_NOTIFY:  0x11000,
-                   Message.T_REPLY:   0x00101,
-                   Message.T_ERROR:   0x00011}.get(self.type)
+                   Message.T_NOTIFY: 0x11000,
+                   Message.T_REPLY: 0x00101,
+                   Message.T_ERROR: 0x00011}.get(self.type)
         if pattern is None:
             return "invalid JSON-RPC message type %s" % self.type
 
@@ -107,7 +110,7 @@ class Message(object):
 
     @staticmethod
     def from_json(json):
-        if type(json) != dict:
+        if not isinstance(json, dict):
             return "message is not a JSON object"
 
         # Make a copy to avoid modifying the caller's dict.
@@ -115,7 +118,7 @@ class Message(object):
 
         if "method" in json:
             method = json.pop("method")
-            if type(method) not in [str, unicode]:
+            if not isinstance(method, six.string_types):
                 return "method is not a JSON string"
         else:
             method = None
@@ -259,10 +262,24 @@ class Connection(object):
         if self.status:
             return self.status, None
 
+        decoder = codecs.getincrementaldecoder('utf-8')()
         while True:
             if not self.input:
                 error, data = self.stream.recv(4096)
+                # Python 3 has separate types for strings and bytes.  We
+                # received bytes from a socket.  We expect it to be string
+                # data, so we convert it here as soon as possible.
+                if data and not error:
+                    try:
+                        data = decoder.decode(data)
+                    except UnicodeError:
+                        error = errno.EILSEQ
                 if error:
+                    if (sys.platform == "win32" and
+                            error == errno.WSAEWOULDBLOCK):
+                        # WSAEWOULDBLOCK would be the equivalent on Windows
+                        # for EAGAIN on Unix.
+                        error = errno.EAGAIN
                     if error == errno.EAGAIN:
                         return error, None
                     else:
@@ -318,7 +335,7 @@ class Connection(object):
     def __process_msg(self):
         json = self.parser.finish()
         self.parser = None
-        if type(json) in [str, unicode]:
+        if isinstance(json, six.string_types):
             # XXX rate-limit
             vlog.warn("%s: error parsing stream: %s" % (self.name, json))
             self.error(errno.EPROTO)
@@ -359,7 +376,7 @@ class Session(object):
         self.seqno = 0
 
     @staticmethod
-    def open(name):
+    def open(name, probe_interval=None):
         """Creates and returns a Session that maintains a JSON-RPC session to
         'name', which should be a string acceptable to ovs.stream.Stream or
         ovs.stream.PassiveStream's initializer.
@@ -370,7 +387,12 @@ class Session(object):
         If 'name' is a passive connection method, e.g. "ptcp:", the new session
         listens for connections to 'name'.  It maintains at most one connection
         at any given time.  Any new connection causes the previous one (if any)
-        to be dropped."""
+        to be dropped.
+
+        If "probe_interval" is zero it disables the connection keepalive
+        feature. If non-zero the value will be forced to at least 1000
+        milliseconds. If None it will just use the default value in OVS.
+        """
         reconnect = ovs.reconnect.Reconnect(ovs.timeval.msec())
         reconnect.set_name(name)
         reconnect.enable(ovs.timeval.msec())
@@ -380,6 +402,8 @@ class Session(object):
 
         if not ovs.stream.stream_or_pstream_needs_probes(name):
             reconnect.set_probe_interval(0)
+        elif probe_interval is not None:
+            reconnect.set_probe_interval(probe_interval)
 
         return Session(reconnect, None)
 
@@ -424,7 +448,7 @@ class Session(object):
                 self.reconnect.connecting(ovs.timeval.msec())
             else:
                 self.reconnect.connect_failed(ovs.timeval.msec(), error)
-        elif self.pstream is not None:
+        elif self.pstream is None:
             error, self.pstream = ovs.stream.PassiveStream.open(name)
             if not error:
                 self.reconnect.listening(ovs.timeval.msec())
@@ -490,7 +514,7 @@ class Session(object):
                 request.id = "echo"
                 self.rpc.send(request)
         else:
-            assert action == None
+            assert action is None
 
     def wait(self, poller):
         if self.rpc is not None:

@@ -1,9 +1,13 @@
 *.debhelper
 *.debhelper.log
 *.substvars
+/autoreconf.after
+/autoreconf.before
 /control
 /copyright
 /files
+/libopenvswitch
+/libopenvswitch-dev
 /nicira-switch
 /openvswitch
 /openvswitch-common
@@ -18,5 +22,10 @@
 /openvswitch-test
 /openvswitch-testcontroller
 /openvswitch-vtep
+/ovn-common
+/ovn-controller-vtep
+/ovn-host
+/ovn-central
+/ovn-docker
 /python-openvswitch
 /tmp

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2012, 2013, 2015 Nicira, Inc.
+ * Copyright (c) 2011, 2012, 2013, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -99,6 +99,25 @@ sset_moved(struct sset *set)
     hmap_moved(&set->map);
 }
 
+/* Initializes 'set' with substrings of 's' that are delimited by any of the
+ * characters in 'delimiters'.  For example,
+ *     sset_from_delimited_string(&set, "a b,c", " ,");
+ * initializes 'set' with three strings "a", "b", and "c". */
+void
+sset_from_delimited_string(struct sset *set, const char *s_,
+                           const char *delimiters)
+{
+    sset_init(set);
+
+    char *s = xstrdup(s_);
+    char *token, *save_ptr = NULL;
+    for (token = strtok_r(s, delimiters, &save_ptr); token != NULL;
+         token = strtok_r(NULL, delimiters, &save_ptr)) {
+        sset_add(set, token);
+    }
+    free(s);
+}
+
 /* Returns true if 'set' contains no strings, false if it contains at least one
  * string. */
 bool
@@ -144,8 +163,7 @@ sset_add_and_free(struct sset *set, char *name)
 void
 sset_add_assert(struct sset *set, const char *name)
 {
-    bool added OVS_UNUSED = sset_add(set, name);
-    ovs_assert(added);
+    ovs_assert(sset_add(set, name));
 }
 
 /* Adds a copy of each of the 'n' names in 'names' to 'set'. */
@@ -195,8 +213,7 @@ sset_find_and_delete(struct sset *set, const char *name)
 void
 sset_find_and_delete_assert(struct sset *set, const char *name)
 {
-    bool deleted OVS_UNUSED = sset_find_and_delete(set, name);
-    ovs_assert(deleted);
+    ovs_assert(sset_find_and_delete(set, name));
 }
 
 /* Removes a string from 'set' and returns a copy of it.  The caller must free
@@ -251,22 +268,34 @@ sset_equals(const struct sset *a, const struct sset *b)
 }
 
 /* Returns the next node in 'set' in hash order, or NULL if no nodes remain in
- * 'set'.  Uses '*bucketp' and '*offsetp' to determine where to begin
- * iteration, and stores new values to pass on the next iteration into them
- * before returning.
+ * 'set'.  Uses '*pos' to determine where to begin iteration, and updates
+ * '*pos' to pass on the next iteration into them before returning.
  *
  * It's better to use plain SSET_FOR_EACH and related functions, since they are
  * faster and better at dealing with ssets that change during iteration.
  *
- * Before beginning iteration, store 0 into '*bucketp' and '*offsetp'.
- */
+ * Before beginning iteration, set '*pos' to all zeros. */
 struct sset_node *
-sset_at_position(const struct sset *set, uint32_t *bucketp, uint32_t *offsetp)
+sset_at_position(const struct sset *set, struct sset_position *pos)
 {
     struct hmap_node *hmap_node;
 
-    hmap_node = hmap_at_position(&set->map, bucketp, offsetp);
+    hmap_node = hmap_at_position(&set->map, &pos->pos);
     return SSET_NODE_FROM_HMAP_NODE(hmap_node);
+}
+
+/* Replaces 'a' by the intersection of 'a' and 'b'.  That is, removes from 'a'
+ * all of the strings that are not also in 'b'. */
+void
+sset_intersect(struct sset *a, const struct sset *b)
+{
+    const char *name, *next;
+
+    SSET_FOR_EACH_SAFE (name, next, a) {
+        if (!sset_contains(b, name)) {
+            sset_delete(a, SSET_NODE_FROM_NAME(name));
+        }
+    }
 }
 
 /* Returns a null-terminated array of pointers to the strings in 'set', in no

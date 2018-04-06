@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 VMware, Inc.
+ * Copyright (c) 2014, 2016 VMware, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,18 +15,20 @@
  */
 
 #include "precomp.h"
+
 #include "Atomic.h"
-#include "NetProto.h"
-#include "Switch.h"
-#include "Vport.h"
+#include "Debug.h"
 #include "Flow.h"
-#include "Vxlan.h"
+#include "Flow.h"
 #include "IpHelper.h"
-#include "Checksum.h"
-#include "User.h"
+#include "NetProto.h"
+#include "Offload.h"
 #include "PacketIO.h"
-#include "Flow.h"
 #include "PacketParser.h"
+#include "Switch.h"
+#include "User.h"
+#include "Vport.h"
+#include "Vxlan.h"
 
 #pragma warning( push )
 #pragma warning( disable:4127 )
@@ -36,7 +38,6 @@
 #undef OVS_DBG_MOD
 #endif
 #define OVS_DBG_MOD OVS_DBG_VXLAN
-#include "Debug.h"
 
 /* Helper macro to check if a VXLAN ID is valid. */
 #define VXLAN_ID_IS_VALID(vxlanID) (0 < (vxlanID) && (vxlanID) <= 0xffffff)
@@ -152,9 +153,9 @@ OvsCleanupVxlanTunnel(PIRP irp,
 
     if (vxlanPort->filterID != 0) {
         status = OvsTunnelFilterDelete(irp,
-				       vxlanPort->filterID,
-				       callback,
-				       tunnelContext);
+                                       vxlanPort->filterID,
+                                       callback,
+                                       tunnelContext);
     } else {
         OvsFreeMemoryWithTag(vport->priv, OVS_VXLAN_POOL_TAG);
         vport->priv = NULL;
@@ -190,28 +191,27 @@ OvsDoEncapVxlan(POVS_VPORT_ENTRY vport,
     POVS_VXLAN_VPORT vportVxlan;
     UINT32 headRoom = OvsGetVxlanTunHdrSize();
     UINT32 packetLength;
+    ULONG mss = 0;
+    NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO csumInfo;
 
-    /*
-     * XXX: the assumption currently is that the NBL is owned by OVS, and
-     * headroom has already been allocated as part of allocating the NBL and
-     * MDL.
-     */
     curNb = NET_BUFFER_LIST_FIRST_NB(curNbl);
     packetLength = NET_BUFFER_DATA_LENGTH(curNb);
-    if (layers->isTcp) {
-        NDIS_TCP_LARGE_SEND_OFFLOAD_NET_BUFFER_LIST_INFO tsoInfo;
 
-        tsoInfo.Value = NET_BUFFER_LIST_INFO(curNbl,
-                TcpLargeSendNetBufferListInfo);
-        OVS_LOG_TRACE("MSS %u packet len %u", tsoInfo.LsoV1Transmit.MSS, packetLength);
-        if (tsoInfo.LsoV1Transmit.MSS) {
+    if (layers->isTcp) {
+        mss = OVSGetTcpMSS(curNbl);
+
+        OVS_LOG_TRACE("MSS %u packet len %u", mss,
+                      packetLength);
+        if (mss) {
             OVS_LOG_TRACE("l4Offset %d", layers->l4Offset);
             *newNbl = OvsTcpSegmentNBL(switchContext, curNbl, layers,
-                        tsoInfo.LsoV1Transmit.MSS, headRoom);
+                                       mss, headRoom, FALSE);
             if (*newNbl == NULL) {
                 OVS_LOG_ERROR("Unable to segment NBL");
                 return NDIS_STATUS_FAILURE;
             }
+            /* Clear out LSO flags after this point */
+            NET_BUFFER_LIST_INFO(*newNbl, TcpLargeSendNetBufferListInfo) = 0;
         }
     }
 
@@ -226,6 +226,13 @@ OvsDoEncapVxlan(POVS_VPORT_ENTRY vport,
             OVS_LOG_ERROR("Unable to copy NBL");
             return NDIS_STATUS_FAILURE;
         }
+        csumInfo.Value = NET_BUFFER_LIST_INFO(curNbl,
+                                              TcpIpChecksumNetBufferListInfo);
+        status = OvsApplySWChecksumOnNB(layers, *newNbl, &csumInfo);
+
+        if (status != NDIS_STATUS_SUCCESS) {
+            goto ret_error;
+        }
     }
 
     curNbl = *newNbl;
@@ -237,7 +244,7 @@ OvsDoEncapVxlan(POVS_VPORT_ENTRY vport,
         }
 
         curMdl = NET_BUFFER_CURRENT_MDL(curNb);
-        bufferStart = (PUINT8)MmGetSystemAddressForMdlSafe(curMdl, LowPagePriority);
+        bufferStart = (PUINT8)OvsGetMdlWithLowPriority(curMdl);
         if (!bufferStart) {
             status = NDIS_STATUS_RESOURCES;
             goto ret_error;
@@ -245,21 +252,19 @@ OvsDoEncapVxlan(POVS_VPORT_ENTRY vport,
 
         bufferStart += NET_BUFFER_CURRENT_MDL_OFFSET(curNb);
         if (NET_BUFFER_NEXT_NB(curNb)) {
-            OVS_LOG_TRACE("nb length %u next %u", NET_BUFFER_DATA_LENGTH(curNb),
+            OVS_LOG_TRACE("nb length %u next %u",
+                          NET_BUFFER_DATA_LENGTH(curNb),
                           NET_BUFFER_DATA_LENGTH(curNb->Next));
         }
 
         /* L2 header */
         ethHdr = (EthHdr *)bufferStart;
-        ASSERT(((PCHAR)&fwdInfo->dstMacAddr + sizeof fwdInfo->dstMacAddr) ==
-               (PCHAR)&fwdInfo->srcMacAddr);
         NdisMoveMemory(ethHdr->Destination, fwdInfo->dstMacAddr,
-                       sizeof ethHdr->Destination + sizeof ethHdr->Source);
+                       sizeof ethHdr->Destination);
+        NdisMoveMemory(ethHdr->Source, fwdInfo->srcMacAddr,
+                       sizeof ethHdr->Source);
         ethHdr->Type = htons(ETH_TYPE_IPV4);
 
-        // XXX: question: there are fields in the OvsIPv4TunnelKey for ttl and such,
-        // should we use those values instead? or will they end up being
-        // uninitialized;
         /* IP header */
         ipHdr = (IPHdr *)((PCHAR)ethHdr + sizeof *ethHdr);
 
@@ -277,16 +282,23 @@ OvsDoEncapVxlan(POVS_VPORT_ENTRY vport,
         ASSERT(tunKey->src == fwdInfo->srcIpAddr || tunKey->src == 0);
         ipHdr->saddr = fwdInfo->srcIpAddr;
         ipHdr->daddr = fwdInfo->dstIpAddr;
+
         ipHdr->check = 0;
-        ipHdr->check = IPChecksum((UINT8 *)ipHdr, sizeof *ipHdr, 0);
 
         /* UDP header */
         udpHdr = (UDPHdr *)((PCHAR)ipHdr + sizeof *ipHdr);
         udpHdr->source = htons(tunKey->flow_hash | MAXINT16);
-        udpHdr->dest = htons(vportVxlan->dstPort);
+        udpHdr->dest = tunKey->dst_port ? tunKey->dst_port :
+                                          htons(vportVxlan->dstPort);
         udpHdr->len = htons(NET_BUFFER_DATA_LENGTH(curNb) - headRoom +
                             sizeof *udpHdr + sizeof *vxlanHdr);
-        udpHdr->check = 0;
+
+        if (tunKey->flags & OVS_TNL_F_CSUM) {
+            udpHdr->check = IPPseudoChecksum(&ipHdr->saddr, &ipHdr->daddr,
+                                             IPPROTO_UDP, ntohs(udpHdr->len));
+        } else {
+            udpHdr->check = 0;
+        }
 
         /* VXLAN header */
         vxlanHdr = (VXLANHdr *)((PCHAR)udpHdr + sizeof *udpHdr);
@@ -294,12 +306,21 @@ OvsDoEncapVxlan(POVS_VPORT_ENTRY vport,
         vxlanHdr->locallyReplicate = 0;
         vxlanHdr->flags2 = 0;
         vxlanHdr->reserved1 = 0;
-        if (tunKey->flags | OVS_TNL_F_KEY) {
-            vxlanHdr->vxlanID = VXLAN_TUNNELID_TO_VNI(tunKey->tunnelId);
-            vxlanHdr->instanceID = 1;
-        }
+        vxlanHdr->vxlanID = VXLAN_TUNNELID_TO_VNI(tunKey->tunnelId);
+        vxlanHdr->instanceID = 1;
         vxlanHdr->reserved2 = 0;
     }
+
+    csumInfo.Value = 0;
+    csumInfo.Transmit.IpHeaderChecksum = 1;
+    csumInfo.Transmit.IsIPv4 = 1;
+    if (tunKey->flags & OVS_TNL_F_CSUM) {
+        csumInfo.Transmit.UdpChecksum = 1;
+    }
+    NET_BUFFER_LIST_INFO(curNbl,
+                         TcpIpChecksumNetBufferListInfo) = csumInfo.Value;
+
+
     return STATUS_SUCCESS;
 
 ret_error:
@@ -313,7 +334,7 @@ ret_error:
  *----------------------------------------------------------------------------
  * OvsEncapVxlan --
  *     Encapsulates the packet if L2/L3 for destination resolves. Otherwise,
- *     enqueues a callback that does encapsulatation after resolution.
+ *     enqueues a callback that does encapsulation after resolution.
  *----------------------------------------------------------------------------
  */
 NDIS_STATUS
@@ -322,15 +343,15 @@ OvsEncapVxlan(POVS_VPORT_ENTRY vport,
               OvsIPv4TunnelKey *tunKey,
               POVS_SWITCH_CONTEXT switchContext,
               POVS_PACKET_HDR_INFO layers,
-              PNET_BUFFER_LIST *newNbl)
+              PNET_BUFFER_LIST *newNbl,
+              POVS_FWD_INFO switchFwdInfo)
 {
     NTSTATUS status;
     OVS_FWD_INFO fwdInfo;
 
-    status = OvsLookupIPFwdInfo(tunKey->dst, &fwdInfo);
+    status = OvsLookupIPFwdInfo(tunKey->src, tunKey->dst, &fwdInfo);
     if (status != STATUS_SUCCESS) {
         OvsFwdIPHelperRequest(NULL, 0, tunKey, NULL, NULL, NULL);
-        // return NDIS_STATUS_PENDING;
         /*
          * XXX: Don't know if the completionList will make any sense when
          * accessed in the callback. Make sure the caveats are known.
@@ -341,52 +362,12 @@ OvsEncapVxlan(POVS_VPORT_ENTRY vport,
         return NDIS_STATUS_FAILURE;
     }
 
+    RtlCopyMemory(switchFwdInfo->value, fwdInfo.value, sizeof fwdInfo.value);
+
     return OvsDoEncapVxlan(vport, curNbl, tunKey, &fwdInfo, layers,
                            switchContext, newNbl);
 }
 
-/*
- *----------------------------------------------------------------------------
- * OvsCalculateUDPChecksum
- *     Calculate UDP checksum
- *----------------------------------------------------------------------------
- */
-static __inline NDIS_STATUS
-OvsCalculateUDPChecksum(PNET_BUFFER_LIST curNbl,
-                        PNET_BUFFER curNb,
-                        IPHdr *ipHdr,
-                        UDPHdr *udpHdr,
-                        UINT32 packetLength)
-{
-    NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO csumInfo;
-    UINT16 checkSum;
-
-    csumInfo.Value = NET_BUFFER_LIST_INFO(curNbl, TcpIpChecksumNetBufferListInfo);
-
-    /* Next check if UDP checksum has been calculated. */
-    if (!csumInfo.Receive.UdpChecksumSucceeded) {
-        UINT32 l4Payload;
-
-        checkSum = udpHdr->check;
-
-        l4Payload = packetLength - sizeof(EthHdr) - ipHdr->ihl * 4;
-        udpHdr->check = 0;
-        udpHdr->check =
-            IPPseudoChecksum((UINT32 *)&ipHdr->saddr,
-                             (UINT32 *)&ipHdr->daddr,
-                             IPPROTO_UDP, (UINT16)l4Payload);
-        udpHdr->check = CalculateChecksumNB(curNb, (UINT16)l4Payload,
-            sizeof(EthHdr) + ipHdr->ihl * 4);
-        if (checkSum != udpHdr->check) {
-            OVS_LOG_TRACE("UDP checksum incorrect.");
-            return NDIS_STATUS_INVALID_PACKET;
-        }
-    }
-
-    csumInfo.Receive.UdpChecksumSucceeded = 1;
-    NET_BUFFER_LIST_INFO(curNbl, TcpIpChecksumNetBufferListInfo) = csumInfo.Value;
-    return NDIS_STATUS_SUCCESS;
-}
 
 /*
  *----------------------------------------------------------------------------
@@ -406,15 +387,21 @@ OvsDecapVxlan(POVS_SWITCH_CONTEXT switchContext,
     IPHdr *ipHdr;
     UDPHdr *udpHdr;
     VXLANHdr *vxlanHdr;
-    UINT32 tunnelSize = 0, packetLength = 0;
+    UINT32 tunnelSize, packetLength;
     PUINT8 bufferStart;
     NDIS_STATUS status;
+    OVS_PACKET_HDR_INFO layers = { 0 };
 
-    /* Check the the length of the UDP payload */
+    status = OvsExtractLayers(curNbl, &layers);
+    if (status != NDIS_STATUS_SUCCESS) {
+        return status;
+    }
+
+    /* Check the length of the UDP payload */
     curNb = NET_BUFFER_LIST_FIRST_NB(curNbl);
     packetLength = NET_BUFFER_DATA_LENGTH(curNb);
-    tunnelSize = OvsGetVxlanTunHdrSize();
-    if (packetLength <= tunnelSize) {
+    tunnelSize = OvsGetVxlanTunHdrSizeFromLayers(&layers);
+    if (packetLength < tunnelSize) {
         return NDIS_STATUS_INVALID_LENGTH;
     }
 
@@ -422,7 +409,7 @@ OvsDecapVxlan(POVS_SWITCH_CONTEXT switchContext,
      * Create a copy of the NBL so that we have all the headers in one MDL.
      */
     *newNbl = OvsPartialCopyNBL(switchContext, curNbl,
-                                tunnelSize + OVS_DEFAULT_COPY_SIZE, 0,
+                                tunnelSize, 0,
                                 TRUE /*copy NBL info */);
 
     if (*newNbl == NULL) {
@@ -433,8 +420,8 @@ OvsDecapVxlan(POVS_SWITCH_CONTEXT switchContext,
     curNbl = *newNbl;
     curNb = NET_BUFFER_LIST_FIRST_NB(curNbl);
     curMdl = NET_BUFFER_CURRENT_MDL(curNb);
-    bufferStart = (PUINT8)MmGetSystemAddressForMdlSafe(curMdl, LowPagePriority) +
-                  NET_BUFFER_CURRENT_MDL_OFFSET(curNb);
+    bufferStart = (PUINT8)OvsGetMdlWithLowPriority(curMdl)
+        + NET_BUFFER_CURRENT_MDL_OFFSET(curNb);
     if (!bufferStart) {
         status = NDIS_STATUS_RESOURCES;
         goto dropNbl;
@@ -442,13 +429,13 @@ OvsDecapVxlan(POVS_SWITCH_CONTEXT switchContext,
 
     ethHdr = (EthHdr *)bufferStart;
     /* XXX: Handle IP options. */
-    ipHdr = (IPHdr *)((PCHAR)ethHdr + sizeof *ethHdr);
+    ipHdr = (IPHdr *)(bufferStart + layers.l3Offset);
     tunKey->src = ipHdr->saddr;
     tunKey->dst = ipHdr->daddr;
     tunKey->tos = ipHdr->tos;
     tunKey->ttl = ipHdr->ttl;
     tunKey->pad = 0;
-    udpHdr = (UDPHdr *)((PCHAR)ipHdr + sizeof *ipHdr);
+    udpHdr = (UDPHdr *)(bufferStart + layers.l4Offset);
 
     /* Validate if NIC has indicated checksum failure. */
     status = OvsValidateUDPChecksum(curNbl, udpHdr->check == 0);
@@ -458,7 +445,9 @@ OvsDecapVxlan(POVS_SWITCH_CONTEXT switchContext,
 
     /* Calculate and verify UDP checksum if NIC didn't do it. */
     if (udpHdr->check != 0) {
-        status = OvsCalculateUDPChecksum(curNbl, curNb, ipHdr, udpHdr, packetLength);
+        tunKey->flags |= OVS_TNL_F_CSUM;
+        status = OvsCalculateUDPChecksum(curNbl, curNb, ipHdr, udpHdr,
+                                         packetLength, &layers);
         if (status != NDIS_STATUS_SUCCESS) {
             goto dropNbl;
         }
@@ -466,10 +455,10 @@ OvsDecapVxlan(POVS_SWITCH_CONTEXT switchContext,
 
     vxlanHdr = (VXLANHdr *)((PCHAR)udpHdr + sizeof *udpHdr);
     if (vxlanHdr->instanceID) {
-        tunKey->flags = OVS_TNL_F_KEY;
+        tunKey->flags |= OVS_TNL_F_KEY;
         tunKey->tunnelId = VXLAN_VNI_TO_TUNNELID(vxlanHdr->vxlanID);
     } else {
-        tunKey->flags = 0;
+        tunKey->flags &= ~OVS_TNL_F_KEY;
         tunKey->tunnelId = 0;
     }
 
@@ -505,13 +494,17 @@ OvsSlowPathDecapVxlan(const PNET_BUFFER_LIST packet,
         if (nh) {
             layers.l4Offset = layers.l3Offset + nh->ihl * 4;
         } else {
-            break;
+           status = NDIS_STATUS_INVALID_PACKET;
+           break;
         }
 
         /* make sure it's a VXLAN packet */
         udp = OvsGetUdp(packet, layers.l4Offset, &udpStorage);
         if (udp) {
             layers.l7Offset = layers.l4Offset + sizeof *udp;
+            if (udp->check != 0) {
+                tunnelKey->flags |= OVS_TNL_F_CSUM;
+            }
         } else {
             break;
         }
@@ -527,10 +520,10 @@ OvsSlowPathDecapVxlan(const PNET_BUFFER_LIST packet,
             tunnelKey->ttl = nh->ttl;
             tunnelKey->tos = nh->tos;
             if (VxlanHeader->instanceID) {
-                tunnelKey->flags = OVS_TNL_F_KEY;
+                tunnelKey->flags |= OVS_TNL_F_KEY;
                 tunnelKey->tunnelId = VXLAN_VNI_TO_TUNNELID(VxlanHeader->vxlanID);
             } else {
-                tunnelKey->flags = 0;
+                tunnelKey->flags &= ~OVS_TNL_F_KEY;
                 tunnelKey->tunnelId = 0;
             }
         } else {

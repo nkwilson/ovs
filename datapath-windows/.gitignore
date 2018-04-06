@@ -1,4 +1,7 @@
+/.vs
 /Package/x64/
+*.db
+*.opendb
 *.opensdf
 *.sdf
 /ovsext/x64/

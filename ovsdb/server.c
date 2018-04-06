@@ -19,13 +19,14 @@
 
 #include "hash.h"
 #include "ovsdb.h"
+#include "uuid.h"
 
 /* Initializes 'session' as a session within 'server'. */
 void
 ovsdb_session_init(struct ovsdb_session *session, struct ovsdb_server *server)
 {
     session->server = server;
-    list_init(&session->completions);
+    ovs_list_init(&session->completions);
     hmap_init(&session->waiters);
 }
 
@@ -60,7 +61,7 @@ ovsdb_session_get_lock_waiter(const struct ovsdb_session *session,
 struct ovsdb_lock_waiter *
 ovsdb_lock_get_owner(const struct ovsdb_lock *lock)
 {
-    return CONTAINER_OF(list_front(&lock->waiters),
+    return CONTAINER_OF(ovs_list_front(&lock->waiters),
                         struct ovsdb_lock_waiter, lock_node);
 }
 
@@ -77,10 +78,10 @@ ovsdb_lock_waiter_remove(struct ovsdb_lock_waiter *waiter)
 {
     struct ovsdb_lock *lock = waiter->lock;
 
-    list_remove(&waiter->lock_node);
+    ovs_list_remove(&waiter->lock_node);
     waiter->lock = NULL;
 
-    if (list_is_empty(&lock->waiters)) {
+    if (ovs_list_is_empty(&lock->waiters)) {
         hmap_remove(&lock->server->locks, &lock->hmap_node);
         free(lock->name);
         free(lock);
@@ -121,6 +122,7 @@ ovsdb_server_init(struct ovsdb_server *server)
 {
     shash_init(&server->dbs);
     hmap_init(&server->locks);
+    uuid_generate(&server->uuid);
 }
 
 /* Adds 'db' to the set of databases served out by 'server'.  Returns true if
@@ -129,20 +131,14 @@ ovsdb_server_init(struct ovsdb_server *server)
 bool
 ovsdb_server_add_db(struct ovsdb_server *server, struct ovsdb *db)
 {
-    return shash_add_once(&server->dbs, db->schema->name, db);
+    return shash_add_once(&server->dbs, db->name, db);
 }
 
-/* Removes 'db' from the set of databases served out by 'server'.  Returns
- * true if successful, false if there is no db associated with
- * db->schema->name. */
-bool
+/* Removes 'db' from the set of databases served out by 'server'. */
+void
 ovsdb_server_remove_db(struct ovsdb_server *server, struct ovsdb *db)
 {
-    void *data = shash_find_and_delete(&server->dbs, db->schema->name);
-    if (data) {
-        return true;
-    }
-    return false;
+    shash_find_and_delete_assert(&server->dbs, db->name);
 }
 
 /* Destroys 'server'. */
@@ -169,7 +165,7 @@ ovsdb_server_create_lock__(struct ovsdb_server *server, const char *lock_name,
     lock->server = server;
     lock->name = xstrdup(lock_name);
     hmap_insert(&server->locks, &lock->hmap_node, hash);
-    list_init(&lock->waiters);
+    ovs_list_init(&lock->waiters);
 
     return lock;
 }
@@ -197,7 +193,7 @@ ovsdb_server_lock(struct ovsdb_server *server,
     struct ovsdb_lock *lock;
 
     lock = ovsdb_server_create_lock__(server, lock_name, hash);
-    victim = (mode == OVSDB_LOCK_STEAL && !list_is_empty(&lock->waiters)
+    victim = (mode == OVSDB_LOCK_STEAL && !ovs_list_is_empty(&lock->waiters)
               ? ovsdb_lock_get_owner(lock)
               : NULL);
 
@@ -206,9 +202,9 @@ ovsdb_server_lock(struct ovsdb_server *server,
     waiter->lock_name = xstrdup(lock_name);
     waiter->lock = lock;
     if (mode == OVSDB_LOCK_STEAL) {
-        list_push_front(&lock->waiters, &waiter->lock_node);
+        ovs_list_push_front(&lock->waiters, &waiter->lock_node);
     } else {
-        list_push_back(&lock->waiters, &waiter->lock_node);
+        ovs_list_push_back(&lock->waiters, &waiter->lock_node);
     }
     waiter->session = session;
     hmap_insert(&waiter->session->waiters, &waiter->session_node, hash);

@@ -1,11 +1,20 @@
 # -*- shell-script -*-
 HAVE_OPENSSL='@HAVE_OPENSSL@'
 HAVE_PYTHON='@HAVE_PYTHON@'
+HAVE_PYTHON3='@HAVE_PYTHON3@'
 EGREP='@EGREP@'
-PERL='@PERL@'
 
 if test x"$PYTHON" = x; then
     PYTHON='@PYTHON@'
+fi
+
+if test x"$PYTHON3" = x; then
+    PYTHON3='@PYTHON3@'
+
+    # PYTHONCOERCECLOCALE=0 disables the Unicode compatibility warning on
+    # stderr that breaks almost any Python3 test (PEP 0538)
+    PYTHONCOERCECLOCALE=0
+    export PYTHONCOERCECLOCALE
 fi
 
 PYTHONPATH=$abs_top_srcdir/python:$abs_top_builddir/tests:$PYTHONPATH
@@ -98,15 +107,82 @@ FreeBSD|NetBSD)
 esac
 
 # Check whether to run IPv6 tests.
-if perl -e 'use Socket; socket(FH, PF_INET6, SOCK_STREAM, 0) || exit 1;'; then
+if $PYTHON -c '
+import socket
+socket.socket(family=socket.AF_INET6).bind(("::1", 0, 0, 0))
+'; then
     HAVE_IPV6=yes
 else
     HAVE_IPV6=no
 fi
 
-# XXX: Disable Python related tests on Windows because Open vSwitch code
-# written in Python has not been ported to the Windows platform. We will
-# need to remove the next block after porting is complete.
-if test "$IS_WIN32" = "yes"; then
-    HAVE_PYTHON="no"
+# Look for a python L7 library 'LIB' in the system. If it is found, defines
+# HAVE_LIB="yes", otherwise HAVE_LIB="no"
+find_l7_lib()
+{
+    set +x
+    var=HAVE_`echo "$1" | tr '[a-z]' '[A-Z]'`
+    if test "$HAVE_PYTHON" = "yes"; then
+        result=$($PYTHON $abs_top_srcdir/tests/test-l7.py --help | grep "$1")
+        if test "x${result}" != x; then
+            eval ${var}="yes"
+        else
+            eval ${var}="no"
+        fi
+    else
+        eval ${var}="no"
+    fi
+}
+
+# HAVE_FTP
+find_l7_lib ftp
+# HAVE_TFTP
+find_l7_lib tftp
+
+# Look for a commnand in the system. If it is found, defines
+# HAVE_COMMAND="yes", otherwise HAVE_COMMAND="no".
+find_command()
+{
+    which $1 > /dev/null 2>&1
+    status=$?
+    var=HAVE_`echo "$1" | tr '[a-z]' '[A-Z]'`
+    if test "$status" = "0"; then
+        eval ${var}="yes"
+    else
+        eval ${var}="no"
+    fi
+}
+
+# Set HAVE_NC
+find_command nc
+
+# Determine correct netcat option to quit on stdin EOF
+if nc --version 2>&1 | grep -q nmap.org; then
+    # Nmap netcat
+    NC_EOF_OPT="--send-only -w 5"
+else
+    # BSD netcat
+    NC_EOF_OPT="-q 1 -w 5"
 fi
+
+# Set HAVE_TCPDUMP
+find_command tcpdump
+
+CURL_OPT="-g -v --max-time 1 --retry 2 --retry-delay 1 --connect-timeout 1"
+
+# Determine whether "diff" supports "normal" diffs.  (busybox diff does not.)
+if echo xyzzy | diff /dev/null - | grep '^>' >/dev/null; then
+    DIFF_SUPPORTS_NORMAL_FORMAT=yes
+else
+    DIFF_SUPPORTS_NORMAL_FORMAT=no
+fi
+
+# Turn off proxies.
+unset http_proxy
+unset https_proxy
+unset ftp_proxy
+unset no_proxy
+unset HTTP_PROXY
+unset HTTPS_PROXY
+unset FTP_PROXY
+unset NO_PROXY

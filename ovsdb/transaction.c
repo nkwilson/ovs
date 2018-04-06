@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014 Nicira, Inc.
+/* Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,17 +18,23 @@
 #include "transaction.h"
 
 #include "bitmap.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
+#include "file.h"
 #include "hash.h"
-#include "hmap.h"
-#include "json.h"
-#include "list.h"
+#include "monitor.h"
+#include "openvswitch/hmap.h"
+#include "openvswitch/json.h"
+#include "openvswitch/list.h"
+#include "openvswitch/poll-loop.h"
+#include "openvswitch/vlog.h"
 #include "ovsdb-error.h"
 #include "ovsdb.h"
 #include "row.h"
+#include "storage.h"
 #include "table.h"
-#include "perf-counter.h"
 #include "uuid.h"
+
+VLOG_DEFINE_THIS_MODULE(transaction);
 
 struct ovsdb_txn {
     struct ovsdb *db;
@@ -102,7 +108,7 @@ ovsdb_txn_create(struct ovsdb *db)
 {
     struct ovsdb_txn *txn = xmalloc(sizeof *txn);
     txn->db = db;
-    list_init(&txn->txn_tables);
+    ovs_list_init(&txn->txn_tables);
     ds_init(&txn->comment);
     return txn;
 }
@@ -110,7 +116,7 @@ ovsdb_txn_create(struct ovsdb *db)
 static void
 ovsdb_txn_free(struct ovsdb_txn *txn)
 {
-    ovs_assert(list_is_empty(&txn->txn_tables));
+    ovs_assert(ovs_list_is_empty(&txn->txn_tables));
     ds_destroy(&txn->comment);
     free(txn);
 }
@@ -271,16 +277,18 @@ update_row_ref_count(struct ovsdb_txn *txn, struct ovsdb_txn_row *r)
         const struct ovsdb_column *column = node->data;
         struct ovsdb_error *error;
 
-        if (r->old) {
-            error = ovsdb_txn_adjust_row_refs(txn, r->old, column, -1);
-            if (error) {
-                return OVSDB_WRAP_BUG("error decreasing refcount", error);
+        if (bitmap_is_set(r->changed, column->index)) {
+            if (r->old) {
+                error = ovsdb_txn_adjust_row_refs(txn, r->old, column, -1);
+                if (error) {
+                    return OVSDB_WRAP_BUG("error decreasing refcount", error);
+                }
             }
-        }
-        if (r->new) {
-            error = ovsdb_txn_adjust_row_refs(txn, r->new, column, 1);
-            if (error) {
-                return error;
+            if (r->new) {
+                error = ovsdb_txn_adjust_row_refs(txn, r->new, column, 1);
+                if (error) {
+                    return error;
+                }
             }
         }
     }
@@ -434,9 +442,48 @@ ovsdb_txn_row_commit(struct ovsdb_txn *txn OVS_UNUSED,
     return NULL;
 }
 
+static struct ovsdb_error *
+ovsdb_txn_update_weak_refs(struct ovsdb_txn *txn OVS_UNUSED,
+                           struct ovsdb_txn_row *txn_row)
+{
+    struct ovsdb_weak_ref *weak, *next;
+
+    /* Remove the weak references originating in the old version of the row. */
+    if (txn_row->old) {
+        LIST_FOR_EACH_SAFE (weak, next, src_node, &txn_row->old->src_refs) {
+            ovs_list_remove(&weak->src_node);
+            ovs_list_remove(&weak->dst_node);
+            free(weak);
+        }
+    }
+
+    /* Although the originating rows have the responsibility of updating the
+     * weak references in the dst, it is possible that some source rows aren't
+     * part of the transaction.  In that situation this row needs to move the
+     * list of incoming weak references from the old row into the new one.
+     */
+    if (txn_row->old && txn_row->new) {
+        /* Move the incoming weak references from old to new. */
+        ovs_list_push_back_all(&txn_row->new->dst_refs,
+                               &txn_row->old->dst_refs);
+    }
+
+    /* Insert the weak references originating in the new version of the row. */
+    struct ovsdb_row *dst_row;
+    if (txn_row->new) {
+        LIST_FOR_EACH (weak, src_node, &txn_row->new->src_refs) {
+            /* dst_row MUST exist. */
+            dst_row = CONST_CAST(struct ovsdb_row *,
+                    ovsdb_table_get_row(weak->dst_table, &weak->dst));
+            ovs_list_insert(&dst_row->dst_refs, &weak->dst_node);
+        }
+    }
+
+    return NULL;
+}
+
 static void
-add_weak_ref(struct ovsdb_txn *txn,
-             const struct ovsdb_row *src_, const struct ovsdb_row *dst_)
+add_weak_ref(const struct ovsdb_row *src_, const struct ovsdb_row *dst_)
 {
     struct ovsdb_row *src = CONST_CAST(struct ovsdb_row *, src_);
     struct ovsdb_row *dst = CONST_CAST(struct ovsdb_row *, dst_);
@@ -446,11 +493,9 @@ add_weak_ref(struct ovsdb_txn *txn,
         return;
     }
 
-    dst = ovsdb_txn_row_modify(txn, dst);
-
-    if (!list_is_empty(&dst->dst_refs)) {
+    if (!ovs_list_is_empty(&dst->dst_refs)) {
         /* Omit duplicates. */
-        weak = CONTAINER_OF(list_back(&dst->dst_refs),
+        weak = CONTAINER_OF(ovs_list_back(&dst->dst_refs),
                             struct ovsdb_weak_ref, dst_node);
         if (weak->src == src) {
             return;
@@ -459,8 +504,11 @@ add_weak_ref(struct ovsdb_txn *txn,
 
     weak = xmalloc(sizeof *weak);
     weak->src = src;
-    list_push_back(&dst->dst_refs, &weak->dst_node);
-    list_push_back(&src->src_refs, &weak->src_node);
+    weak->dst_table = dst->table;
+    weak->dst = *ovsdb_row_get_uuid(dst);
+    /* The dst_refs list is updated at commit time. */
+    ovs_list_init(&weak->dst_node);
+    ovs_list_push_back(&src->src_refs, &weak->src_node);
 }
 
 static struct ovsdb_error * OVS_WARN_UNUSED_RESULT
@@ -469,7 +517,7 @@ assess_weak_refs(struct ovsdb_txn *txn, struct ovsdb_txn_row *txn_row)
     struct ovsdb_table *table;
     struct shash_node *node;
 
-    if (txn_row->old) {
+    if (txn_row->old && !txn_row->new) {
         /* Mark rows that have weak references to 'txn_row' as modified, so
          * that their weak references will get reassessed. */
         struct ovsdb_weak_ref *weak, *next;
@@ -504,7 +552,7 @@ assess_weak_refs(struct ovsdb_txn *txn, struct ovsdb_txn_row *txn_row)
                 row = ovsdb_table_get_row(column->type.key.u.uuid.refTable,
                                           &datum->keys[i].uuid);
                 if (row) {
-                    add_weak_ref(txn, txn_row->new, row);
+                    add_weak_ref(txn_row->new, row);
                     i++;
                 } else {
                     if (uuid_is_zero(&datum->keys[i].uuid)) {
@@ -522,7 +570,7 @@ assess_weak_refs(struct ovsdb_txn *txn, struct ovsdb_txn_row *txn_row)
                 row = ovsdb_table_get_row(column->type.value.u.uuid.refTable,
                                           &datum->values[i].uuid);
                 if (row) {
-                    add_weak_ref(txn, txn_row->new, row);
+                    add_weak_ref(txn_row->new, row);
                     i++;
                 } else {
                     if (uuid_is_zero(&datum->values[i].uuid)) {
@@ -534,7 +582,6 @@ assess_weak_refs(struct ovsdb_txn *txn, struct ovsdb_txn_row *txn_row)
         }
 
         if (datum->n != orig_n) {
-            bitmap_set1(txn_row->changed, OVSDB_COL_VERSION);
             bitmap_set1(txn_row->changed, column->index);
             ovsdb_datum_sort_assert(datum, column->type.key.type);
             if (datum->n < column->type.n_min) {
@@ -748,41 +795,58 @@ check_index_uniqueness(struct ovsdb_txn *txn OVS_UNUSED,
     return NULL;
 }
 
-static struct ovsdb_error *
-ovsdb_txn_commit_(struct ovsdb_txn *txn, bool durable)
+static struct ovsdb_error * OVS_WARN_UNUSED_RESULT
+update_version(struct ovsdb_txn *txn OVS_UNUSED, struct ovsdb_txn_row *txn_row)
 {
-    struct ovsdb_replica *replica;
+    struct ovsdb_table *table = txn_row->table;
+    size_t n_columns = shash_count(&table->schema->columns);
+
+    if (txn_row->old && txn_row->new
+        && !bitmap_is_all_zeros(txn_row->changed, n_columns)) {
+        bitmap_set1(txn_row->changed, OVSDB_COL_VERSION);
+        uuid_generate(ovsdb_row_get_version_rw(txn_row->new));
+    }
+
+    return NULL;
+}
+
+static bool
+ovsdb_txn_is_empty(const struct ovsdb_txn *txn)
+{
+    return ovs_list_is_empty(&txn->txn_tables);
+}
+
+static struct ovsdb_error * OVS_WARN_UNUSED_RESULT
+ovsdb_txn_precommit(struct ovsdb_txn *txn)
+{
     struct ovsdb_error *error;
 
     /* Figure out what actually changed, and abort early if the transaction
      * was really a no-op. */
     error = for_each_txn_row(txn, determine_changes);
     if (error) {
+        ovsdb_txn_abort(txn);
         return OVSDB_WRAP_BUG("can't happen", error);
     }
-    if (list_is_empty(&txn->txn_tables)) {
-        ovsdb_txn_abort(txn);
+    if (ovs_list_is_empty(&txn->txn_tables)) {
         return NULL;
     }
 
     /* Update reference counts and check referential integrity. */
     error = update_ref_counts(txn);
     if (error) {
-        ovsdb_txn_abort(txn);
         return error;
     }
 
     /* Delete unreferenced, non-root rows. */
     error = for_each_txn_row(txn, collect_garbage);
     if (error) {
-        ovsdb_txn_abort(txn);
         return OVSDB_WRAP_BUG("can't happen", error);
     }
 
     /* Check maximum rows table constraints. */
     error = check_max_rows(txn);
     if (error) {
-        ovsdb_txn_abort(txn);
         return error;
     }
 
@@ -790,45 +854,208 @@ ovsdb_txn_commit_(struct ovsdb_txn *txn, bool durable)
      * integrity. */
     error = for_each_txn_row(txn, assess_weak_refs);
     if (error) {
-        ovsdb_txn_abort(txn);
         return error;
     }
 
     /* Verify that the indexes will still be unique post-transaction. */
     error = for_each_txn_row(txn, check_index_uniqueness);
     if (error) {
-        ovsdb_txn_abort(txn);
         return error;
     }
 
-    /* Send the commit to each replica. */
-    LIST_FOR_EACH (replica, node, &txn->db->replicas) {
-        error = (replica->class->commit)(replica, txn, durable);
-        if (error) {
-            /* We don't support two-phase commit so only the first replica is
-             * allowed to report an error. */
-            ovs_assert(&replica->node == txn->db->replicas.next);
+    /* Update _version for rows that changed.  */
+    error = for_each_txn_row(txn, update_version);
+    if (error) {
+        return OVSDB_WRAP_BUG("can't happen", error);
+    }
 
-            ovsdb_txn_abort(txn);
+    return error;
+}
+
+/* Finalize commit. */
+void
+ovsdb_txn_complete(struct ovsdb_txn *txn)
+{
+    if (!ovsdb_txn_is_empty(txn)) {
+        txn->db->run_triggers = true;
+        ovsdb_monitors_commit(txn->db, txn);
+        ovsdb_error_assert(for_each_txn_row(txn, ovsdb_txn_update_weak_refs));
+        ovsdb_error_assert(for_each_txn_row(txn, ovsdb_txn_row_commit));
+    }
+    ovsdb_txn_free(txn);
+}
+
+/* Applies 'txn' to the internal representation of the database.  This is for
+ * transactions that don't need to be written to storage; probably, they came
+ * from storage.  These transactions shouldn't ordinarily fail because storage
+ * should contain only consistent transactions.  (One exception is for database
+ * conversion in ovsdb_convert().) */
+struct ovsdb_error * OVS_WARN_UNUSED_RESULT
+ovsdb_txn_replay_commit(struct ovsdb_txn *txn)
+{
+    struct ovsdb_error *error = ovsdb_txn_precommit(txn);
+    if (error) {
+        ovsdb_txn_abort(txn);
+    } else {
+        ovsdb_txn_complete(txn);
+    }
+    return error;
+}
+
+/* If 'error' is nonnull, the transaction is complete, with the given error as
+ * the result.
+ *
+ * Otherwise, if 'write' is nonnull, then the transaction is waiting for
+ * 'write' to complete.
+ *
+ * Otherwise, if 'commit_index' is nonzero, then the transaction is waiting for
+ * 'commit_index' to be applied to the storage.
+ *
+ * Otherwise, the transaction is complete and successful. */
+struct ovsdb_txn_progress {
+    struct ovsdb_error *error;
+    struct ovsdb_write *write;
+    uint64_t commit_index;
+
+    struct ovsdb_storage *storage;
+};
+
+struct ovsdb_txn_progress *
+ovsdb_txn_propose_schema_change(struct ovsdb *db,
+                                const struct json *schema,
+                                const struct json *data)
+{
+    struct ovsdb_txn_progress *progress = xzalloc(sizeof *progress);
+    progress->storage = db->storage;
+
+    struct uuid next;
+    struct ovsdb_write *write = ovsdb_storage_write_schema_change(
+        db->storage, schema, data, &db->prereq, &next);
+    if (!ovsdb_write_is_complete(write)) {
+        progress->write = write;
+    } else {
+        progress->error = ovsdb_error_clone(ovsdb_write_get_error(write));
+        ovsdb_write_destroy(write);
+    }
+    return progress;
+}
+
+struct ovsdb_txn_progress *
+ovsdb_txn_propose_commit(struct ovsdb_txn *txn, bool durable)
+{
+    struct ovsdb_txn_progress *progress = xzalloc(sizeof *progress);
+    progress->storage = txn->db->storage;
+    progress->error = ovsdb_txn_precommit(txn);
+    if (progress->error) {
+        return progress;
+    }
+
+    /* Turn the commit into the format used for the storage logs.. */
+    struct json *txn_json = ovsdb_file_txn_to_json(txn);
+    if (!txn_json) {
+        /* Nothing to do, so success. */
+        return progress;
+    }
+    txn_json = ovsdb_file_txn_annotate(txn_json, ovsdb_txn_get_comment(txn));
+
+    struct uuid next;
+    struct ovsdb_write *write = ovsdb_storage_write(
+        txn->db->storage, txn_json, &txn->db->prereq, &next, durable);
+    json_destroy(txn_json);
+    if (!ovsdb_write_is_complete(write)) {
+        progress->write = write;
+    } else {
+        progress->error = ovsdb_error_clone(ovsdb_write_get_error(write));
+        ovsdb_write_destroy(write);
+    }
+    return progress;
+}
+
+/* Proposes 'txn' for commitment and then waits for the commit to succeed or
+ * fail.  Returns null if successful, otherwise the error.
+ *
+ * **In addition**, this function also completes or aborts the transaction if
+ * the transaction succeeded or failed, respectively. */
+struct ovsdb_error * OVS_WARN_UNUSED_RESULT
+ovsdb_txn_propose_commit_block(struct ovsdb_txn *txn, bool durable)
+{
+    struct ovsdb_txn_progress *p = ovsdb_txn_propose_commit(txn, durable);
+    for (;;) {
+        ovsdb_storage_run(p->storage);
+        if (ovsdb_txn_progress_is_complete(p)) {
+            struct ovsdb_error *error
+                = ovsdb_error_clone(ovsdb_txn_progress_get_error(p));
+            ovsdb_txn_progress_destroy(p);
+
+            if (error) {
+                ovsdb_txn_abort(txn);
+            } else {
+                ovsdb_txn_complete(txn);
+            }
+
             return error;
+        }
+        ovsdb_storage_wait(p->storage);
+        poll_block();
+    }
+}
+
+static void
+ovsdb_txn_progress_run(struct ovsdb_txn_progress *p)
+{
+    if (p->error) {
+        return;
+    }
+
+    if (p->write) {
+        if (!ovsdb_write_is_complete(p->write)) {
+            return;
+        }
+        p->error = ovsdb_error_clone(ovsdb_write_get_error(p->write));
+        p->commit_index = ovsdb_write_get_commit_index(p->write);
+        ovsdb_write_destroy(p->write);
+        p->write = NULL;
+
+        if (p->error) {
+            return;
         }
     }
 
-    /* Finalize commit. */
-    txn->db->run_triggers = true;
-    ovsdb_error_assert(for_each_txn_row(txn, ovsdb_txn_row_commit));
-    ovsdb_txn_free(txn);
-
-    return NULL;
+    if (p->commit_index) {
+        if (ovsdb_storage_get_applied_index(p->storage) >= p->commit_index) {
+            p->commit_index = 0;
+        }
+    }
 }
 
-struct ovsdb_error *
-ovsdb_txn_commit(struct ovsdb_txn *txn, bool durable)
+static bool
+ovsdb_txn_progress_is_complete__(const struct ovsdb_txn_progress *p)
 {
-   struct ovsdb_error *err;
+    return p->error || (!p->write && !p->commit_index);
+}
 
-   PERF(__func__, err = ovsdb_txn_commit_(txn, durable));
-   return err;
+bool
+ovsdb_txn_progress_is_complete(const struct ovsdb_txn_progress *p)
+{
+    ovsdb_txn_progress_run(CONST_CAST(struct ovsdb_txn_progress *, p));
+    return ovsdb_txn_progress_is_complete__(p);
+}
+
+const struct ovsdb_error *
+ovsdb_txn_progress_get_error(const struct ovsdb_txn_progress *p)
+{
+    ovs_assert(ovsdb_txn_progress_is_complete__(p));
+    return p->error;
+}
+
+void
+ovsdb_txn_progress_destroy(struct ovsdb_txn_progress *p)
+{
+    if (p) {
+        ovsdb_error_destroy(p->error);
+        ovsdb_write_destroy(p->write);
+        free(p);
+    }
 }
 
 void
@@ -863,7 +1090,7 @@ ovsdb_txn_create_txn_table(struct ovsdb_txn *txn, struct ovsdb_table *table)
         for (i = 0; i < table->schema->n_indexes; i++) {
             hmap_init(&txn_table->txn_indexes[i]);
         }
-        list_push_back(&txn->txn_tables, &txn_table->node);
+        ovs_list_push_back(&txn->txn_tables, &txn_table->node);
     }
     return table->txn_table;
 }
@@ -915,7 +1142,6 @@ ovsdb_txn_row_modify(struct ovsdb_txn *txn, const struct ovsdb_row *ro_row_)
 
         rw_row = ovsdb_row_clone(ro_row);
         rw_row->n_refs = ro_row->n_refs;
-        uuid_generate(ovsdb_row_get_version_rw(rw_row));
         ovsdb_txn_row_create(txn, table, ro_row, rw_row);
         hmap_replace(&table->rows, &ro_row->hmap_node, &rw_row->hmap_node);
 
@@ -1005,7 +1231,7 @@ ovsdb_txn_table_destroy(struct ovsdb_txn_table *txn_table)
 
     txn_table->table->txn_table = NULL;
     hmap_destroy(&txn_table->txn_rows);
-    list_remove(&txn_table->node);
+    ovs_list_remove(&txn_table->node);
     free(txn_table);
 }
 

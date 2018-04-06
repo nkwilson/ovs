@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2010, 2011, 2012 Nicira, Inc.
+/* Copyright (c) 2009, 2010, 2011, 2012, 2015, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,13 @@
 #include <stdlib.h>
 #include "compiler.h"
 #include "ovsdb-types.h"
-#include "shash.h"
+#include "openvswitch/shash.h"
+
+#ifdef  __cplusplus
+extern "C" {
+#endif
+
+#define MAX_OVSDB_ATOM_RANGE_SIZE 4096
 
 struct ds;
 struct ovsdb_symbol_table;
@@ -89,7 +95,7 @@ struct ovsdb_error *ovsdb_atom_from_json(union ovsdb_atom *,
 struct json *ovsdb_atom_to_json(const union ovsdb_atom *,
                                 enum ovsdb_atomic_type);
 
-char *ovsdb_atom_from_string(union ovsdb_atom *,
+char *ovsdb_atom_from_string(union ovsdb_atom *, union ovsdb_atom **,
                              const struct ovsdb_base_type *, const char *,
                              struct ovsdb_symbol_table *)
     OVS_WARN_UNUSED_RESULT;
@@ -127,6 +133,7 @@ struct ovsdb_datum {
     union ovsdb_atom *keys;     /* Each of the ovsdb_type's 'key_type'. */
     union ovsdb_atom *values;   /* Each of the ovsdb_type's 'value_type'. */
 };
+#define OVSDB_DATUM_INITIALIZER { 0, NULL, NULL }
 
 /* Basics. */
 void ovsdb_datum_init_empty(struct ovsdb_datum *);
@@ -161,6 +168,16 @@ struct ovsdb_error *ovsdb_datum_from_json(struct ovsdb_datum *,
                                           const struct json *,
                                           struct ovsdb_symbol_table *)
     OVS_WARN_UNUSED_RESULT;
+struct ovsdb_error *ovsdb_transient_datum_from_json(
+                                          struct ovsdb_datum *,
+                                          const struct ovsdb_type *,
+                                          const struct json *)
+    OVS_WARN_UNUSED_RESULT;
+struct ovsdb_error *
+ovsdb_unconstrained_datum_from_json(struct ovsdb_datum *,
+                                    const struct ovsdb_type *,
+                                    const struct json *)
+    OVS_WARN_UNUSED_RESULT;
 struct json *ovsdb_datum_to_json(const struct ovsdb_datum *,
                                  const struct ovsdb_type *);
 
@@ -173,7 +190,13 @@ void ovsdb_datum_to_string(const struct ovsdb_datum *,
 void ovsdb_datum_to_bare(const struct ovsdb_datum *,
                          const struct ovsdb_type *, struct ds *);
 
-void ovsdb_datum_from_smap(struct ovsdb_datum *, struct smap *);
+void ovsdb_datum_from_smap(struct ovsdb_datum *, const struct smap *);
+
+struct ovsdb_error *ovsdb_datum_convert(struct ovsdb_datum *dst,
+                                        const struct ovsdb_type *dst_type,
+                                        const struct ovsdb_datum *src,
+                                        const struct ovsdb_type *src_type)
+    OVS_WARN_UNUSED_RESULT;
 
 /* Comparison. */
 uint32_t ovsdb_datum_hash(const struct ovsdb_datum *,
@@ -211,13 +234,31 @@ void ovsdb_datum_subtract(struct ovsdb_datum *a,
                           const struct ovsdb_datum *b,
                           const struct ovsdb_type *b_type);
 
+/* Generate and apply diffs */
+void ovsdb_datum_diff(struct ovsdb_datum *diff,
+                      const struct ovsdb_datum *old_datum,
+                      const struct ovsdb_datum *new_datum,
+                      const struct ovsdb_type *type);
+
+struct ovsdb_error *ovsdb_datum_apply_diff(struct ovsdb_datum *new_datum,
+                                           const struct ovsdb_datum *old_datum,
+                                           const struct ovsdb_datum *diff,
+                                           const struct ovsdb_type *type)
+OVS_WARN_UNUSED_RESULT;
+
 /* Raw operations that may not maintain the invariants. */
 void ovsdb_datum_remove_unsafe(struct ovsdb_datum *, size_t idx,
                                const struct ovsdb_type *);
 void ovsdb_datum_add_unsafe(struct ovsdb_datum *,
                             const union ovsdb_atom *key,
                             const union ovsdb_atom *value,
-                            const struct ovsdb_type *);
+                            const struct ovsdb_type *,
+                            const union ovsdb_atom *range_end_atom);
+
+/* Transactions with named-uuid row names. */
+struct json *ovsdb_datum_to_json_with_row_names(const struct ovsdb_datum *,
+                                                const struct ovsdb_type *);
+char *ovsdb_data_row_name(const struct uuid *);
 
 /* Type checking. */
 static inline bool
@@ -257,5 +298,12 @@ struct ovsdb_symbol *ovsdb_symbol_table_insert(struct ovsdb_symbol_table *,
 
 char *ovsdb_token_parse(const char **, char **outp) OVS_WARN_UNUSED_RESULT;
 bool ovsdb_token_is_delim(unsigned char);
+
+struct ovsdb_error *ovsdb_atom_range_check_size(int64_t range_start,
+                                                int64_t range_end);
+
+#ifdef  __cplusplus
+}
+#endif
 
 #endif /* ovsdb-data.h */

@@ -33,8 +33,14 @@ struct dpctl_params {
     /* --may-create: Allow mod-flows command to create a new flow? */
     bool may_create;
 
+    /* --read-only: Do not run R/W commands? */
+    bool read_only;
+
     /* -m, --more: Increase output verbosity. */
     int verbosity;
+
+    /* --names: Use port names in output? */
+    bool names;
 
     /* Callback for printing.  This function is called from dpctl_run_command()
      * to output data.  The 'aux' parameter is set to the 'aux'

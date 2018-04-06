@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 Nicira, Inc.
+ * Copyright (c) 2014, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,12 +18,20 @@
 #include "daemon.h"
 #include "daemon-private.h"
 #include <stdio.h>
+#include <io.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include "dirs.h"
+#include "fatal-signal.h"
 #include "ovs-thread.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(daemon_windows);
+
+/* Constants for flock function */
+#define	LOCK_SHARED	0x0                     /* Shared lock. */
+#define	LOCK_UNLOCK	0x80000000              /* Unlock. Custom value. */
 
 static bool service_create;          /* Was --service specified? */
 static bool service_started;         /* Have we dispatched service to start? */
@@ -71,8 +79,7 @@ daemon_usage(void)
         "\nService options:\n"
         "  --service               run in background as a service.\n"
         "  --service-monitor       restart the service in case of an "
-                                   "unexpected failure. \n",
-        ovs_rundir(), program_name);
+                                   "unexpected failure. \n");
 }
 
 /* Registers the call-back and configures the actions in case of a failure
@@ -131,12 +138,11 @@ service_start(int *argcp, char **argvp[])
         *argcp = sargc;
         *argvp = *sargvp;
 
-        /* XXX: Windows implementation cannot have a unixctl commands in the
-        * traditional sense of unix domain sockets. If an implementation is
-        * done that involves 'unixctl' vlog commands the following call is
-        * needed to make sure that the unixctl commands for vlog get
-        * registered in a daemon, even before the first log message. */
-        vlog_init();
+        /* Enable default error mode so we can take advantage of WER
+         * (Windows Error Reporting) crash dumps.
+         * Being a service it does not allow for WER window pop-up.
+         * XXX implement our on crash dump collection mechanism. */
+        SetErrorMode(0);
 
         return;
     }
@@ -191,6 +197,7 @@ control_handler(DWORD request)
         service_status.dwCurrentState = SERVICE_STOPPED;
         service_status.dwWin32ExitCode = NO_ERROR;
         SetEvent(wevent);
+        SetServiceStatus(hstatus, &service_status);
         break;
 
     default:
@@ -403,9 +410,39 @@ detach_process(int argc, char *argv[])
 }
 
 static void
+flock(FILE* fd, int operation)
+{
+    HANDLE hFile;
+    OVERLAPPED ov = {0};
+
+    hFile = (HANDLE)_get_osfhandle(fileno(fd));
+    if (hFile == INVALID_HANDLE_VALUE) {
+        VLOG_FATAL("Failed to get PID file handle (%s).",
+                   ovs_strerror(errno));
+    }
+
+    if (operation & LOCK_UNLOCK) {
+        if (UnlockFileEx(hFile, 0, 1, 0, &ov) == 0) {
+            VLOG_FATAL("Failed to unlock PID file (%s).",
+                       ovs_lasterror_to_string());
+        }
+    } else {
+       /* Use LOCKFILE_FAIL_IMMEDIATELY flag to avoid hang of another daemon that tries to
+           acquire exclusive lock over the same PID file */
+        if (LockFileEx(hFile, operation | LOCKFILE_FAIL_IMMEDIATELY,
+                       0, 1, 0, &ov) == FALSE) {
+            VLOG_FATAL("Failed to lock PID file (%s).",
+                       ovs_lasterror_to_string());
+        }
+    }
+}
+
+static void
 unlink_pidfile(void)
 {
     if (filep_pidfile) {
+        /* Remove the shared lock on file */
+        flock(filep_pidfile, LOCK_UNLOCK);
         fclose(filep_pidfile);
     }
     if (pidfile) {
@@ -436,17 +473,24 @@ make_pidfile(void)
         VLOG_FATAL("failed to open %s (%s)", pidfile, ovs_strerror(errno));
     }
 
+    flock(filep_pidfile, LOCKFILE_EXCLUSIVE_LOCK);
+
     fatal_signal_add_hook(unlink_pidfile, NULL, NULL, true);
 
-    fprintf(filep_pidfile, "%d\n", _getpid());
+    fprintf(filep_pidfile, "%ld\n", (long int) getpid());
     if (fflush(filep_pidfile) == EOF) {
         VLOG_FATAL("Failed to write into the pidfile %s", pidfile);
     }
 
+    flock(filep_pidfile, LOCK_SHARED);
+    /* This will remove the exclusive lock. The shared lock will remain */
+    flock(filep_pidfile, LOCK_UNLOCK);
+
     /* Don't close the pidfile till the process exits. */
 }
 
-void daemonize_start(void)
+void
+daemonize_start(bool access_datapath OVS_UNUSED)
 {
     if (pidfile) {
         make_pidfile();
@@ -473,14 +517,29 @@ daemonize_complete(void)
     service_complete();
 }
 
+void
+daemon_become_new_user(bool access_datapath OVS_UNUSED)
+{
+}
+
 /* Returns the file name that would be used for a pidfile if 'name' were
  * provided to set_pidfile().  The caller must free the returned string. */
 char *
 make_pidfile_name(const char *name)
 {
-    if (name && strchr(name, ':')) {
-        return xstrdup(name);
+    if (name) {
+        if (strchr(name, ':')) {
+            return xstrdup(name);
+        } else {
+            return xasprintf("%s/%s", ovs_rundir(), name);
+        }
     } else {
         return xasprintf("%s/%s.pid", ovs_rundir(), program_name);
     }
+}
+
+void
+daemon_set_new_user(const char *user_spec OVS_UNUSED)
+{
+    VLOG_FATAL("--user options is not currently supported.");
 }

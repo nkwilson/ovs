@@ -37,8 +37,7 @@
 #define OVS_TUNNEL_INDEX_START RESERVED_START_INDEX1
 #define OVS_VXLAN_VPORT_INDEX    2
 #define OVS_GRE_VPORT_INDEX      3
-#define OVS_GRE64_VPORT_INDEX    4
-#define OVS_TUNNEL_INDEX_END OVS_GRE64_VPORT_INDEX
+#define OVS_TUNNEL_INDEX_END OVS_GRE_VPORT_INDEX
 
 #define OVS_MAX_PHYS_ADAPTERS    32
 #define OVS_MAX_IP_VPOR          32
@@ -104,7 +103,7 @@ typedef struct _OVS_SWITCH_CONTEXT
      *
      * The "real" physical external NIC has 'NicIndex' > 0. For each
      * external interface, virtual or physical, NDIS gives an NIC level
-     * OID callback. Note that, even though there are multile "NICs",
+     * OID callback. Note that, even though there are multiple "NICs",
      * there's only one underlying Hyper-V port. Thus, we get a single
      * NDIS port-level callback, but multiple NDIS NIC-level callbacks.
      *
@@ -128,9 +127,10 @@ typedef struct _OVS_SWITCH_CONTEXT
      * 'numPhysicalNics'.
      */
     NDIS_SWITCH_PORT_ID     virtualExternalPortId;
-    NDIS_SWITCH_PORT_ID     internalPortId;
-    POVS_VPORT_ENTRY        virtualExternalVport;   // the virtual adapter vport
-    POVS_VPORT_ENTRY        internalVport;
+    POVS_VPORT_ENTRY        virtualExternalVport;   /* the virtual adapter
+                                                     * vport */
+    INT32                   countInternalVports;    /* the number of internal
+                                                     * vports */
 
     /*
      * 'portIdHashArray' ONLY contains ports that exist on the Hyper-V switch,
@@ -184,6 +184,9 @@ typedef struct _OVS_SWITCH_CONTEXT
 } OVS_SWITCH_CONTEXT, *POVS_SWITCH_CONTEXT;
 
 
+_IRQL_raises_(DISPATCH_LEVEL)
+_IRQL_saves_global_(OldIrql, lockState)
+_Acquires_lock_(datapath->lock)
 static __inline VOID
 OvsAcquireDatapathRead(OVS_DATAPATH *datapath,
                        LOCK_STATE_EX *lockState,
@@ -194,6 +197,9 @@ OvsAcquireDatapathRead(OVS_DATAPATH *datapath,
                           dispatch ? NDIS_RWL_AT_DISPATCH_LEVEL : 0);
 }
 
+_IRQL_raises_(DISPATCH_LEVEL)
+_IRQL_saves_global_(OldIrql, lockState)
+_Acquires_lock_(datapath->lock)
 static __inline VOID
 OvsAcquireDatapathWrite(OVS_DATAPATH *datapath,
                         LOCK_STATE_EX *lockState,
@@ -204,6 +210,10 @@ OvsAcquireDatapathWrite(OVS_DATAPATH *datapath,
                            dispatch ? NDIS_RWL_AT_DISPATCH_LEVEL : 0);
 }
 
+_IRQL_requires_(DISPATCH_LEVEL)
+_IRQL_restores_global_(OldIrql, lockState)
+_Requires_lock_held_(datapath->lock)
+_Releases_lock_(datapath->lock)
 static __inline VOID
 OvsReleaseDatapath(OVS_DATAPATH *datapath,
                    LOCK_STATE_EX *lockState)

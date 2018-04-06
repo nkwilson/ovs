@@ -43,10 +43,6 @@ Open vSwitch Linux kernel module.
 %prep
 
 %setup -n %{oname}-%{version}
-cat > %{oname}.conf << EOF
-override %{oname} * extra/%{oname}
-override %{oname} * weak-updates/%{oname}
-EOF
 
 %build
 for flavor in %flavors_to_build; do
@@ -66,7 +62,42 @@ for flavor in %flavors_to_build ; do
          find $INSTALL_MOD_PATH/lib/modules -iname 'modules.*' -exec rm {} \;
 done
 install -d %{buildroot}%{_sysconfdir}/depmod.d/
+for module in %{buildroot}/lib/modules/%{kernel_version}/$INSTALL_MOD_DIR/*.ko;
+do
+    modname="$(basename ${module})"
+    echo "override ${modname%.ko} * extra/%{oname}" >> %{oname}.conf
+    echo "override ${modname%.ko} * weak-updates/%{oname}" >> %{oname}.conf
+done
 install -m 644 %{oname}.conf %{buildroot}%{_sysconfdir}/depmod.d/
+
+%post
+# Ensure that modprobe will find our modules.
+for k in $(cd /lib/modules && /bin/ls); do
+    [ -d "/lib/modules/$k/kernel/" ] && depmod -a "$k"
+done
+if [ -x "/sbin/weak-modules" ]; then
+    for m in openvswitch vport-gre vport-stt vport-geneve \
+             vport-lisp vport-vxlan; do
+        echo "/lib/modules/%{kernel}/extra/$m.ko"
+    done | /sbin/weak-modules --add-modules
+fi
+
+%postun
+for k in $(cd /lib/modules && /bin/ls); do
+    [ -d "/lib/modules/$k/kernel/" ] && depmod -a "$k"
+done
+if [ "$1" = 0 ]; then  # Erase, not upgrade
+    if [ -x "/sbin/weak-modules" ]; then
+        for m in openvswitch vport-gre vport-stt vport-geneve \
+                 vport-lisp vport-vxlan; do
+        echo "/lib/modules/%{kernel}/extra/$m.ko"
+    done | /sbin/weak-modules --remove-modules
+    fi
+fi
+
+%files
+%defattr(644,root,root)
+/etc/depmod.d/%{oname}.conf
 
 %clean
 rm -rf $RPM_BUILD_ROOT

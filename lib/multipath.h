@@ -19,11 +19,12 @@
 
 #include <stdint.h>
 #include "compiler.h"
-#include "ofp-errors.h"
+#include "openvswitch/ofp-errors.h"
 
 struct ds;
 struct flow;
 struct flow_wildcards;
+struct match;
 struct nx_action_multipath;
 struct ofpact_multipath;
 struct ofpbuf;
@@ -31,7 +32,7 @@ struct ofpbuf;
 /* NXAST_MULTIPATH helper functions. */
 
 enum ofperr multipath_check(const struct ofpact_multipath *,
-                            const struct flow *);
+                            const struct match *);
 
 void multipath_execute(const struct ofpact_multipath *, struct flow *,
                        struct flow_wildcards *);

@@ -20,12 +20,13 @@
 #include <float.h>
 #include <limits.h>
 
-#include "dynamic-string.h"
-#include "json.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/json.h"
 #include "ovs-thread.h"
 #include "ovsdb-data.h"
 #include "ovsdb-error.h"
 #include "ovsdb-parser.h"
+#include "util.h"
 
 const struct ovsdb_type ovsdb_type_integer =
     OVSDB_TYPE_SCALAR_INITIALIZER(OVSDB_BASE_INTEGER_INIT);
@@ -363,6 +364,7 @@ ovsdb_base_type_from_json(struct ovsdb_base_type *base,
 
     error = ovsdb_atomic_type_from_json(&base->type, type);
     if (error) {
+        ovsdb_error_destroy(ovsdb_parser_destroy(&parser));
         return error;
     }
 

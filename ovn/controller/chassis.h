@@ -1,4 +1,4 @@
-/* Copyright (c) 2015 Nicira, Inc.
+/* Copyright (c) 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,17 @@
 #ifndef OVN_CHASSIS_H
 #define OVN_CHASSIS_H 1
 
-struct controller_ctx;
+#include <stdbool.h>
 
-void chassis_init(struct controller_ctx *);
-void chassis_run(struct controller_ctx *);
-void chassis_destroy(struct controller_ctx *);
+struct controller_ctx;
+struct ovsdb_idl;
+struct ovsrec_bridge;
+struct sbrec_chassis;
+
+void chassis_register_ovs_idl(struct ovsdb_idl *);
+const struct sbrec_chassis *chassis_run(struct controller_ctx *,
+                                        const char *chassis_id,
+                                        const struct ovsrec_bridge *br_int);
+bool chassis_cleanup(struct controller_ctx *, const struct sbrec_chassis *);
 
 #endif /* ovn/chassis.h */

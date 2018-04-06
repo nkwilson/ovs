@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 Nicira, Inc.
+ * Copyright (c) 2014, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -120,36 +120,31 @@ COVERAGE_DEFINE(cmap_shrink);
 /* An entry is an int and a pointer: 8 bytes on 32-bit, 12 bytes on 64-bit. */
 #define CMAP_ENTRY_SIZE (4 + (UINTPTR_MAX == UINT32_MAX ? 4 : 8))
 
-/* Number of entries per bucket: 7 on 32-bit, 5 on 64-bit. */
+/* Number of entries per bucket: 7 on 32-bit, 5 on 64-bit for 64B cacheline. */
 #define CMAP_K ((CACHE_LINE_SIZE - 4) / CMAP_ENTRY_SIZE)
-
-/* Pad to make a bucket a full cache line in size: 4 on 32-bit, 0 on 64-bit. */
-#define CMAP_PADDING ((CACHE_LINE_SIZE - 4) - (CMAP_K * CMAP_ENTRY_SIZE))
 
 /* A cuckoo hash bucket.  Designed to be cache-aligned and exactly one cache
  * line long. */
 struct cmap_bucket {
-    /* Allows readers to track in-progress changes.  Initially zero, each
-     * writer increments this value just before and just after each change (see
-     * cmap_set_bucket()).  Thus, a reader can ensure that it gets a consistent
-     * snapshot by waiting for the counter to become even (see
-     * read_even_counter()), then checking that its value does not change while
-     * examining the bucket (see cmap_find()). */
-    atomic_uint32_t counter;
-
-    /* (hash, node) slots.  They are parallel arrays instead of an array of
-     * structs to reduce the amount of space lost to padding.
-     *
-     * The slots are in no particular order.  A null pointer indicates that a
-     * pair is unused.  In-use slots are not necessarily in the earliest
-     * slots. */
-    uint32_t hashes[CMAP_K];
-    struct cmap_node nodes[CMAP_K];
-
     /* Padding to make cmap_bucket exactly one cache line long. */
-#if CMAP_PADDING > 0
-    uint8_t pad[CMAP_PADDING];
-#endif
+    PADDED_MEMBERS(CACHE_LINE_SIZE,
+        /* Allows readers to track in-progress changes.  Initially zero, each
+         * writer increments this value just before and just after each change
+         * (see cmap_set_bucket()).  Thus, a reader can ensure that it gets a
+         * consistent snapshot by waiting for the counter to become even (see
+         * read_even_counter()), then checking that its value does not change
+         * while examining the bucket (see cmap_find()). */
+        atomic_uint32_t counter;
+
+        /* (hash, node) slots.  They are parallel arrays instead of an array of
+         * structs to reduce the amount of space lost to padding.
+         *
+         * The slots are in no particular order.  A null pointer indicates that
+         * a pair is unused.  In-use slots are not necessarily in the earliest
+         * slots. */
+        uint32_t hashes[CMAP_K];
+        struct cmap_node nodes[CMAP_K];
+    );
 };
 BUILD_ASSERT_DECL(sizeof(struct cmap_bucket) == CACHE_LINE_SIZE);
 
@@ -165,18 +160,23 @@ BUILD_ASSERT_DECL(sizeof(struct cmap_bucket) == CACHE_LINE_SIZE);
 
 /* The implementation of a concurrent hash map. */
 struct cmap_impl {
-    unsigned int n;             /* Number of in-use elements. */
-    unsigned int max_n;         /* Max elements before enlarging. */
-    unsigned int min_n;         /* Min elements before shrinking. */
-    uint32_t mask;              /* Number of 'buckets', minus one. */
-    uint32_t basis;             /* Basis for rehashing client's hash values. */
+    PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline0,
+        unsigned int n;             /* Number of in-use elements. */
+        unsigned int max_n;         /* Max elements before enlarging. */
+        unsigned int min_n;         /* Min elements before shrinking. */
+        uint32_t mask;              /* Number of 'buckets', minus one. */
+        uint32_t basis;             /* Basis for rehashing client's
+                                       hash values. */
+    );
 
-    /* Padding to make cmap_impl exactly one cache line long. */
-    uint8_t pad[CACHE_LINE_SIZE - sizeof(unsigned int) * 5];
-
-    struct cmap_bucket buckets[];
+    PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline1,
+        struct cmap_bucket buckets[1];
+    );
 };
-BUILD_ASSERT_DECL(sizeof(struct cmap_impl) == CACHE_LINE_SIZE);
+BUILD_ASSERT_DECL(sizeof(struct cmap_impl) == CACHE_LINE_SIZE * 2);
+
+/* An empty cmap. */
+OVS_ALIGNED_VAR(CACHE_LINE_SIZE) const struct cmap_impl empty_cmap;
 
 static struct cmap_impl *cmap_rehash(struct cmap *, uint32_t mask);
 
@@ -226,8 +226,9 @@ cmap_impl_create(uint32_t mask)
 
     ovs_assert(is_pow2(mask + 1));
 
-    impl = xzalloc_cacheline(sizeof *impl
-                             + (mask + 1) * sizeof *impl->buckets);
+    /* There are 'mask + 1' buckets but struct cmap_impl has one bucket built
+     * in, so we only need to add space for the extra 'mask' buckets. */
+    impl = xzalloc_cacheline(sizeof *impl + mask * sizeof *impl->buckets);
     impl->n = 0;
     impl->max_n = calc_max_n(mask);
     impl->min_n = calc_min_n(mask);
@@ -241,7 +242,7 @@ cmap_impl_create(uint32_t mask)
 void
 cmap_init(struct cmap *cmap)
 {
-    ovsrcu_set(&cmap->impl, cmap_impl_create(0));
+    ovsrcu_set(&cmap->impl, CONST_CAST(struct cmap_impl *, &empty_cmap));
 }
 
 /* Destroys 'cmap'.
@@ -252,7 +253,10 @@ void
 cmap_destroy(struct cmap *cmap)
 {
     if (cmap) {
-        ovsrcu_postpone(free_cacheline, cmap_get_impl(cmap));
+        struct cmap_impl *impl = cmap_get_impl(cmap);
+        if (impl != &empty_cmap) {
+            ovsrcu_postpone(free_cacheline, impl);
+        }
     }
 }
 
@@ -839,11 +843,9 @@ cmap_replace(struct cmap *cmap, struct cmap_node *old_node,
     struct cmap_impl *impl = cmap_get_impl(cmap);
     uint32_t h1 = rehash(impl, hash);
     uint32_t h2 = other_hash(h1);
-    bool ok;
 
-    ok = cmap_replace__(impl, old_node, new_node, hash, h1)
-        || cmap_replace__(impl, old_node, new_node, hash, h2);
-    ovs_assert(ok);
+    ovs_assert(cmap_replace__(impl, old_node, new_node, hash, h1) ||
+               cmap_replace__(impl, old_node, new_node, hash, h2));
 
     if (!new_node) {
         impl->n--;
@@ -892,7 +894,9 @@ cmap_rehash(struct cmap *cmap, uint32_t mask)
 
     new->n = old->n;
     ovsrcu_set(&cmap->impl, new);
-    ovsrcu_postpone(free_cacheline, old);
+    if (old != &empty_cmap) {
+        ovsrcu_postpone(free_cacheline, old);
+    }
 
     return new;
 }

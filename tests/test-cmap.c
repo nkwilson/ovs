@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2013, 2014, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@
 #include "command-line.h"
 #include "fat-rwlock.h"
 #include "hash.h"
-#include "hmap.h"
+#include "openvswitch/hmap.h"
 #include "ovstest.h"
 #include "ovs-thread.h"
 #include "random.h"
@@ -78,7 +78,6 @@ check_cmap(struct cmap *cmap, const int values[], size_t n,
     /* Here we test iteration with cmap_next_position() */
     i = 0;
     while ((node = cmap_next_position(cmap, &pos))) {
-        struct element *e = NULL;
         e = OBJECT_CONTAINING(node, e, node);
 
         assert(i < n);
@@ -128,8 +127,6 @@ check_cmap(struct cmap *cmap, const int values[], size_t n,
         map = cmap_find_batch(cmap, map, hashes, nodes);
 
         ULLONG_FOR_EACH_1(k, map) {
-            struct element *e;
-
             CMAP_NODE_FOR_EACH (e, node, nodes[k]) {
                 count += e->value == values[i + k];
             }
@@ -210,10 +207,9 @@ test_cmap_insert_replace_delete(hash_func *hash)
     struct element elements[N_ELEMS];
     struct element copies[N_ELEMS];
     int values[N_ELEMS];
-    struct cmap cmap;
+    struct cmap cmap = CMAP_INITIALIZER;
     size_t i;
 
-    cmap_init(&cmap);
     for (i = 0; i < N_ELEMS; i++) {
         elements[i].value = i;
         cmap_insert(&cmap, &elements[i].node, hash(i));
@@ -413,7 +409,6 @@ find_batch(const struct cmap *cmap, const int value)
 {
     size_t i, ret;
     const size_t end = MIN(n_batch, n_elems - value);
-    unsigned long map = ~0;
     uint32_t hashes[N_BATCH_MAX];
     const struct cmap_node *nodes[N_BATCH_MAX];
 
@@ -432,7 +427,7 @@ find_batch(const struct cmap *cmap, const int value)
 
     ret = i;
 
-    map >>= BITMAP_ULONG_BITS - i; /* Clear excess bits. */
+    unsigned long map = i ? ~0UL >> (BITMAP_ULONG_BITS - i) : 0;
     map = cmap_find_batch(cmap, map, hashes, nodes);
 
     ULLONG_FOR_EACH_1(i, map) {
@@ -637,9 +632,9 @@ benchmark_hmap(void)
 }
 
 static const struct ovs_cmdl_command commands[] = {
-    {"check", NULL, 0, 1, run_tests},
-    {"benchmark", NULL, 3, 4, run_benchmarks},
-    {NULL, NULL, 0, 0, NULL},
+    {"check", NULL, 0, 1, run_tests, OVS_RO},
+    {"benchmark", NULL, 3, 4, run_benchmarks, OVS_RO},
+    {NULL, NULL, 0, 0, NULL, OVS_RO},
 };
 
 static void

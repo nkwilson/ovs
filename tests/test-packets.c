@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2014 Nicira, Inc.
+ * Copyright (c) 2011, 2014, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -152,12 +152,35 @@ test_ipv6_masking(void)
 }
 
 static void
+test_ipv6_parsing(void)
+{
+    struct in6_addr o_ipv6, p_ipv6;
+    struct in6_addr mask;
+
+    inet_pton(AF_INET6, "2001:db8:0:0:0:0:2:1", &o_ipv6);
+
+    assert(!ipv6_parse_masked("2001:db8:0:0:0:0:2:1/64", &p_ipv6, &mask));
+    assert(ipv6_addr_equals(&o_ipv6, &p_ipv6));
+    assert(ipv6_count_cidr_bits(&mask) == 64);
+
+    assert(!ipv6_parse_masked("2001:db8:0:0:0:0:2:1/ffff:ffff:ffff:ffff::",
+                              &p_ipv6, &mask));
+    assert(ipv6_addr_equals(&o_ipv6, &p_ipv6));
+    assert(ipv6_count_cidr_bits(&mask) == 64);
+
+    assert(!ipv6_parse_masked("2001:db8:0:0:0:0:2:1", &p_ipv6, &mask));
+    assert(ipv6_addr_equals(&o_ipv6, &p_ipv6));
+    assert(ipv6_count_cidr_bits(&mask) == 128);
+}
+
+static void
 test_packets_main(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
 {
     test_ipv4_cidr();
     test_ipv6_static_masks();
     test_ipv6_cidr();
     test_ipv6_masking();
+    test_ipv6_parsing();
 }
 
 OVSTEST_REGISTER("test-packets", test_packets_main);

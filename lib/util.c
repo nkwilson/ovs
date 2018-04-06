@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,12 +33,20 @@
 #include "ovs-rcu.h"
 #include "ovs-thread.h"
 #include "socket-util.h"
+#include "timeval.h"
 #include "openvswitch/vlog.h"
 #ifdef HAVE_PTHREAD_SET_NAME_NP
 #include <pthread_np.h>
 #endif
 
 VLOG_DEFINE_THIS_MODULE(util);
+
+#ifdef __linux__
+#define LINUX 1
+#include <asm/param.h>
+#else
+#define LINUX 0
+#endif
 
 COVERAGE_DEFINE(util_xalloc);
 
@@ -132,7 +140,7 @@ void *
 xmemdup(const void *p_, size_t size)
 {
     void *p = xmalloc(size);
-    memcpy(p, p_, size);
+    nullable_memcpy(p, p_, size);
     return p;
 }
 
@@ -149,6 +157,18 @@ char *
 xstrdup(const char *s)
 {
     return xmemdup0(s, strlen(s));
+}
+
+char * MALLOC_LIKE
+nullable_xstrdup(const char *s)
+{
+    return s ? xstrdup(s) : NULL;
+}
+
+bool
+nullable_string_is_equal(const char *a, const char *b)
+{
+    return a ? b && !strcmp(a, b) : !b;
 }
 
 char *
@@ -176,15 +196,9 @@ x2nrealloc(void *p, size_t *n, size_t s)
     return xrealloc(p, *n * s);
 }
 
-/* The desired minimum alignment for an allocated block of memory. */
-#define MEM_ALIGN MAX(sizeof(void *), 8)
-BUILD_ASSERT_DECL(IS_POW2(MEM_ALIGN));
-BUILD_ASSERT_DECL(CACHE_LINE_SIZE >= MEM_ALIGN);
-
-/* Allocates and returns 'size' bytes of memory in dedicated cache lines.  That
- * is, the memory block returned will not share a cache line with other data,
- * avoiding "false sharing".  (The memory returned will not be at the start of
- * a cache line, though, so don't assume such alignment.)
+/* Allocates and returns 'size' bytes of memory aligned to a cache line and in
+ * dedicated cache lines.  That is, the memory block returned will not share a
+ * cache line with other data, avoiding "false sharing".
  *
  * Use free_cacheline() to free the returned memory block. */
 void *
@@ -201,28 +215,37 @@ xmalloc_cacheline(size_t size)
     }
     return p;
 #else
-    void **payload;
-    void *base;
-
     /* Allocate room for:
      *
-     *     - Up to CACHE_LINE_SIZE - 1 bytes before the payload, so that the
-     *       start of the payload doesn't potentially share a cache line.
+     *     - Header padding: Up to CACHE_LINE_SIZE - 1 bytes, to allow the
+     *       pointer to be aligned exactly sizeof(void *) bytes before the
+     *       beginning of a cache line.
      *
-     *     - A payload consisting of a void *, followed by padding out to
-     *       MEM_ALIGN bytes, followed by 'size' bytes of user data.
+     *     - Pointer: A pointer to the start of the header padding, to allow us
+     *       to free() the block later.
      *
-     *     - Space following the payload up to the end of the cache line, so
-     *       that the end of the payload doesn't potentially share a cache line
-     *       with some following block. */
-    base = xmalloc((CACHE_LINE_SIZE - 1)
-                   + ROUND_UP(MEM_ALIGN + size, CACHE_LINE_SIZE));
-
-    /* Locate the payload and store a pointer to the base at the beginning. */
-    payload = (void **) ROUND_UP((uintptr_t) base, CACHE_LINE_SIZE);
-    *payload = base;
-
-    return (char *) payload + MEM_ALIGN;
+     *     - User data: 'size' bytes.
+     *
+     *     - Trailer padding: Enough to bring the user data up to a cache line
+     *       multiple.
+     *
+     * +---------------+---------+------------------------+---------+
+     * | header        | pointer | user data              | trailer |
+     * +---------------+---------+------------------------+---------+
+     * ^               ^         ^
+     * |               |         |
+     * p               q         r
+     *
+     */
+    void *p = xmalloc((CACHE_LINE_SIZE - 1)
+                      + sizeof(void *)
+                      + ROUND_UP(size, CACHE_LINE_SIZE));
+    bool runt = PAD_SIZE((uintptr_t) p, CACHE_LINE_SIZE) < sizeof(void *);
+    void *r = (void *) ROUND_UP((uintptr_t) p + (runt ? CACHE_LINE_SIZE : 0),
+                                CACHE_LINE_SIZE);
+    void **q = (void **) r - 1;
+    *q = p;
+    return r;
 #endif
 }
 
@@ -245,7 +268,8 @@ free_cacheline(void *p)
     free(p);
 #else
     if (p) {
-        free(*(void **) ((uintptr_t) p - MEM_ALIGN));
+        void **q = (void **) p - 1;
+        free(*q);
     }
 #endif
 }
@@ -295,6 +319,19 @@ ovs_strzcpy(char *dst, const char *src, size_t size)
         memcpy(dst, src, len);
         memset(dst + len, '\0', size - len);
     }
+}
+
+/*
+ * Returns true if 'str' ends with given 'suffix'.
+ */
+int
+string_ends_with(const char *str, const char *suffix)
+{
+    int str_len = strlen(str);
+    int suffix_len = strlen(suffix);
+
+    return (str_len >= suffix_len) &&
+           (0 == strcmp(str + (str_len - suffix_len), suffix));
 }
 
 /* Prints 'format' on stderr, formatting it like printf() does.  If 'err_no' is
@@ -413,6 +450,21 @@ ovs_strerror(int error)
     char *buffer;
     char *s;
 
+    if (error == 0) {
+        /*
+         * strerror(0) varies among platforms:
+         *
+         *   Success
+         *   No error
+         *   Undefined error: 0
+         *
+         * We want to provide a consistent result here because
+         * our testsuite has test cases which strictly matches
+         * log messages containing this string.
+         */
+        return "Success";
+    }
+
     save_errno = errno;
     buffer = strerror_buffer_get()->s;
 
@@ -446,21 +498,19 @@ ovs_strerror(int error)
  * vSwitch.  Otherwise, it is assumed to be an external program linking against
  * the Open vSwitch libraries.
  *
- * The 'date' and 'time' arguments should likely be called with
- * "__DATE__" and "__TIME__" to use the time the binary was built.
- * Alternatively, the "ovs_set_program_name" macro may be called to do this
- * automatically.
  */
 void
-ovs_set_program_name__(const char *argv0, const char *version, const char *date,
-                       const char *time)
+ovs_set_program_name(const char *argv0, const char *version)
 {
     char *basename;
 #ifdef _WIN32
     size_t max_len = strlen(argv0) + 1;
 
     SetErrorMode(GetErrorMode() | SEM_NOGPFAULTERRORBOX);
+#if _MSC_VER < 1900
+     /* This function is deprecated from 1900 (Visual Studio 2015) */
     _set_output_format(_TWO_DIGIT_EXPONENT);
+#endif
 
     basename = xmalloc(max_len);
     _splitpath_s(argv0, NULL, 0, NULL, 0, basename, max_len, NULL, 0);
@@ -481,14 +531,12 @@ ovs_set_program_name__(const char *argv0, const char *version, const char *date,
 
     free(program_version);
     if (!strcmp(version, VERSION)) {
-        program_version = xasprintf("%s (Open vSwitch) "VERSION"\n"
-                                    "Compiled %s %s\n",
-                                    program_name, date, time);
+        program_version = xasprintf("%s (Open vSwitch) "VERSION"\n",
+                                    program_name);
     } else {
         program_version = xasprintf("%s %s\n"
-                                    "Open vSwitch Library "VERSION"\n"
-                                    "Compiled %s %s\n",
-                                    program_name, version, date, time);
+                                    "Open vSwitch Library "VERSION"\n",
+                                    program_name, version);
     }
 }
 
@@ -516,6 +564,66 @@ set_subprogram_name(const char *subprogram_name)
 #elif HAVE_PTHREAD_SET_NAME_NP
     pthread_set_name_np(pthread_self(), pname);
 #endif
+}
+
+unsigned int
+get_page_size(void)
+{
+    static unsigned int cached;
+
+    if (!cached) {
+#ifndef _WIN32
+        long int value = sysconf(_SC_PAGESIZE);
+#else
+        long int value;
+        SYSTEM_INFO sysinfo;
+        GetSystemInfo(&sysinfo);
+        value = sysinfo.dwPageSize;
+#endif
+        if (value >= 0) {
+            cached = value;
+        }
+    }
+
+    return cached;
+}
+
+/* Returns the time at which the system booted, as the number of milliseconds
+ * since the epoch, or 0 if the time of boot cannot be determined. */
+long long int
+get_boot_time(void)
+{
+    static long long int cache_expiration = LLONG_MIN;
+    static long long int boot_time;
+
+    ovs_assert(LINUX);
+
+    if (time_msec() >= cache_expiration) {
+        static const char stat_file[] = "/proc/stat";
+        char line[128];
+        FILE *stream;
+
+        cache_expiration = time_msec() + 5 * 1000;
+
+        stream = fopen(stat_file, "r");
+        if (!stream) {
+            VLOG_ERR_ONCE("%s: open failed (%s)",
+                          stat_file, ovs_strerror(errno));
+            return boot_time;
+        }
+
+        while (fgets(line, sizeof line, stream)) {
+            long long int btime;
+            if (ovs_scan(line, "btime %lld", &btime)) {
+                boot_time = btime * 1000;
+                goto done;
+            }
+        }
+        VLOG_ERR_ONCE("%s: btime not found", stat_file);
+    done:
+        fclose(stream);
+    }
+    return boot_time;
 }
 
 /* Returns a pointer to a string describing the program version.  The
@@ -554,48 +662,53 @@ void
 ovs_hex_dump(FILE *stream, const void *buf_, size_t size,
              uintptr_t ofs, bool ascii)
 {
-  const uint8_t *buf = buf_;
-  const size_t per_line = 16; /* Maximum bytes per line. */
+    const uint8_t *buf = buf_;
+    const size_t per_line = 16; /* Maximum bytes per line. */
 
-  while (size > 0)
-    {
-      size_t start, end, n;
-      size_t i;
+    while (size > 0) {
+        size_t i;
 
-      /* Number of bytes on this line. */
-      start = ofs % per_line;
-      end = per_line;
-      if (end - start > size)
-        end = start + size;
-      n = end - start;
-
-      /* Print line. */
-      fprintf(stream, "%08"PRIxMAX"  ", (uintmax_t) ROUND_DOWN(ofs, per_line));
-      for (i = 0; i < start; i++)
-        fprintf(stream, "   ");
-      for (; i < end; i++)
-        fprintf(stream, "%02x%c",
-                buf[i - start], i == per_line / 2 - 1? '-' : ' ');
-      if (ascii)
-        {
-          for (; i < per_line; i++)
-            fprintf(stream, "   ");
-          fprintf(stream, "|");
-          for (i = 0; i < start; i++)
-            fprintf(stream, " ");
-          for (; i < end; i++) {
-              int c = buf[i - start];
-              putc(c >= 32 && c < 127 ? c : '.', stream);
-          }
-          for (; i < per_line; i++)
-            fprintf(stream, " ");
-          fprintf(stream, "|");
+        /* Number of bytes on this line. */
+        size_t start = ofs % per_line;
+        size_t end = per_line;
+        if (end - start > size) {
+            end = start + size;
         }
-      fprintf(stream, "\n");
+        size_t n = end - start;
 
-      ofs += n;
-      buf += n;
-      size -= n;
+        /* Print line. */
+        fprintf(stream, "%08"PRIxMAX" ",
+                (uintmax_t) ROUND_DOWN(ofs, per_line));
+        for (i = 0; i < start; i++) {
+            fprintf(stream, "   ");
+        }
+        for (; i < end; i++) {
+            fprintf(stream, "%c%02x",
+                    i == per_line / 2 ? '-' : ' ', buf[i - start]);
+        }
+        if (ascii) {
+            fprintf(stream, " ");
+            for (; i < per_line; i++) {
+                fprintf(stream, "   ");
+            }
+            fprintf(stream, "|");
+            for (i = 0; i < start; i++) {
+                fprintf(stream, " ");
+            }
+            for (; i < end; i++) {
+                int c = buf[i - start];
+                putc(c >= 32 && c < 127 ? c : '.', stream);
+            }
+            for (; i < per_line; i++) {
+                fprintf(stream, " ");
+            }
+            fprintf(stream, "|");
+        }
+        fprintf(stream, "\n");
+
+        ofs += n;
+        buf += n;
+        size -= n;
     }
 }
 
@@ -604,8 +717,13 @@ str_to_int(const char *s, int base, int *i)
 {
     long long ll;
     bool ok = str_to_llong(s, base, &ll);
+
+    if (!ok || ll < INT_MIN || ll > INT_MAX) {
+        *i = 0;
+        return false;
+    }
     *i = ll;
-    return ok;
+    return true;
 }
 
 bool
@@ -613,18 +731,34 @@ str_to_long(const char *s, int base, long *li)
 {
     long long ll;
     bool ok = str_to_llong(s, base, &ll);
+
+    if (!ok || ll < LONG_MIN || ll > LONG_MAX) {
+        *li = 0;
+        return false;
+    }
     *li = ll;
-    return ok;
+    return true;
 }
 
 bool
 str_to_llong(const char *s, int base, long long *x)
 {
-    int save_errno = errno;
     char *tail;
+    bool ok = str_to_llong_with_tail(s, &tail, base, x);
+    if (*tail != '\0') {
+        *x = 0;
+        return false;
+    }
+    return ok;
+}
+
+bool
+str_to_llong_with_tail(const char *s, char **tail, int base, long long *x)
+{
+    int save_errno = errno;
     errno = 0;
-    *x = strtoll(s, &tail, base);
-    if (errno == EINVAL || errno == ERANGE || tail == s || *tail != '\0') {
+    *x = strtoll(s, tail, base);
+    if (errno == EINVAL || errno == ERANGE || *tail == s) {
         errno = save_errno;
         *x = 0;
         return false;
@@ -646,6 +780,39 @@ str_to_uint(const char *s, int base, unsigned int *u)
         *u = ll;
         return true;
     }
+}
+
+bool
+str_to_ullong(const char *s, int base, unsigned long long *x)
+{
+    int save_errno = errno;
+    char *tail;
+
+    errno = 0;
+    *x = strtoull(s, &tail, base);
+    if (errno == EINVAL || errno == ERANGE || tail == s || *tail != '\0') {
+        errno = save_errno;
+        *x = 0;
+        return false;
+    } else {
+        errno = save_errno;
+        return true;
+    }
+}
+
+bool
+str_to_llong_range(const char *s, int base, long long *begin,
+                   long long *end)
+{
+    char *tail;
+    if (str_to_llong_with_tail(s, &tail, base, begin)
+        && *tail == '-'
+        && str_to_llong(tail + 1, base, end)) {
+        return true;
+    }
+    *begin = 0;
+    *end = 0;
+    return false;
 }
 
 /* Converts floating-point string 's' into a double.  If successful, stores
@@ -674,34 +841,21 @@ str_to_double(const char *s, double *d)
 
 /* Returns the value of 'c' as a hexadecimal digit. */
 int
-hexit_value(int c)
+hexit_value(unsigned char c)
 {
-    switch (c) {
-    case '0': case '1': case '2': case '3': case '4':
-    case '5': case '6': case '7': case '8': case '9':
-        return c - '0';
+    static const signed char tbl[UCHAR_MAX + 1] = {
+#define TBL(x)                                  \
+        (  x >= '0' && x <= '9' ? x - '0'       \
+         : x >= 'a' && x <= 'f' ? x - 'a' + 0xa \
+         : x >= 'A' && x <= 'F' ? x - 'A' + 0xa \
+         : -1)
+#define TBL0(x)  TBL(x),  TBL((x) + 1),   TBL((x) + 2),   TBL((x) + 3)
+#define TBL1(x) TBL0(x), TBL0((x) + 4),  TBL0((x) + 8),  TBL0((x) + 12)
+#define TBL2(x) TBL1(x), TBL1((x) + 16), TBL1((x) + 32), TBL1((x) + 48)
+        TBL2(0), TBL2(64), TBL2(128), TBL2(192)
+    };
 
-    case 'a': case 'A':
-        return 0xa;
-
-    case 'b': case 'B':
-        return 0xb;
-
-    case 'c': case 'C':
-        return 0xc;
-
-    case 'd': case 'D':
-        return 0xd;
-
-    case 'e': case 'E':
-        return 0xe;
-
-    case 'f': case 'F':
-        return 0xf;
-
-    default:
-        return -1;
-    }
+    return tbl[c];
 }
 
 /* Returns the integer value of the 'n' hexadecimal digits starting at 's', or
@@ -900,12 +1054,19 @@ base_name(const char *file_name)
  * which itself must be absolute.  'dir' may be null or the empty string, in
  * which case the current working directory is used.
  *
+ * Additionally on Windows, if 'file_name' has a ':', returns a copy of
+ * 'file_name'
+ *
  * Returns a null pointer if 'dir' is null and getcwd() fails. */
 char *
 abs_file_name(const char *dir, const char *file_name)
 {
     if (file_name[0] == '/') {
         return xstrdup(file_name);
+#ifdef _WIN32
+    } else if (strchr(file_name, ':')) {
+        return xstrdup(file_name);
+#endif
     } else if (dir && dir[0]) {
         char *separator = dir[strlen(dir) - 1] == '/' ? "" : "/";
         return xasprintf("%s%s%s", dir, separator, file_name);
@@ -927,6 +1088,10 @@ abs_file_name(const char *dir, const char *file_name)
 static char *
 xreadlink(const char *filename)
 {
+#ifdef _WIN32
+    errno = ENOENT;
+    return NULL;
+#else
     size_t size;
 
     for (size = 64; ; size *= 2) {
@@ -945,6 +1110,7 @@ xreadlink(const char *filename)
             return NULL;
         }
     }
+#endif
 }
 
 /* Returns a version of 'filename' with symlinks in the final component
@@ -1104,34 +1270,33 @@ const uint8_t count_1bits_8[256] = {
 };
 #endif
 
-/* Returns true if the 'n' bytes starting at 'p' are zeros. */
+/* Returns true if the 'n' bytes starting at 'p' are 'byte'. */
 bool
-is_all_zeros(const void *p_, size_t n)
+is_all_byte(const void *p_, size_t n, uint8_t byte)
 {
     const uint8_t *p = p_;
     size_t i;
 
     for (i = 0; i < n; i++) {
-        if (p[i] != 0x00) {
+        if (p[i] != byte) {
             return false;
         }
     }
     return true;
 }
 
+/* Returns true if the 'n' bytes starting at 'p' are zeros. */
+bool
+is_all_zeros(const void *p, size_t n)
+{
+    return is_all_byte(p, n, 0);
+}
+
 /* Returns true if the 'n' bytes starting at 'p' are 0xff. */
 bool
-is_all_ones(const void *p_, size_t n)
+is_all_ones(const void *p, size_t n)
 {
-    const uint8_t *p = p_;
-    size_t i;
-
-    for (i = 0; i < n; i++) {
-        if (p[i] != 0xff) {
-            return false;
-        }
-    }
-    return true;
+    return is_all_byte(p, n, 0xff);
 }
 
 /* Copies 'n_bits' bits starting from bit 'src_ofs' in 'src' to the 'n_bits'
@@ -1400,14 +1565,45 @@ bitwise_scan(const void *p, unsigned int len, bool target, unsigned int start,
 int
 bitwise_rscan(const void *p, unsigned int len, bool target, int start, int end)
 {
+    const uint8_t *s = p;
+    int start_byte = len - (start / 8 + 1);
+    int end_byte = len - (end / 8 + 1);
+    int ofs_byte;
     int ofs;
+    uint8_t the_byte;
 
-    for (ofs = start; ofs > end; ofs--) {
-        if (bitwise_get_bit(p, len, ofs) == target) {
+    /* Find the target in the start_byte from starting offset */
+    ofs_byte = start_byte;
+    the_byte = s[ofs_byte];
+    for (ofs = start % 8; ofs >= 0; ofs--) {
+        if (((the_byte & (1u << ofs)) != 0) == target) {
             break;
         }
     }
-    return ofs;
+    if (ofs < 0) {
+        /* Target not found in start byte, continue searching byte by byte */
+        for (ofs_byte = start_byte + 1; ofs_byte <= end_byte; ofs_byte++) {
+            if ((target && s[ofs_byte])
+                    || (!target && (s[ofs_byte] != 0xff))) {
+               break;
+            }
+        }
+        if (ofs_byte > end_byte) {
+            return end;
+        }
+        the_byte = s[ofs_byte];
+        /* Target is in the_byte, find it bit by bit */
+        for (ofs = 7; ofs >= 0; ofs--) {
+            if (((the_byte & (1u << ofs)) != 0) == target) {
+                break;
+            }
+        }
+    }
+    int ret = (len - ofs_byte) * 8 - (8 - ofs);
+    if (ret < end) {
+        return end;
+    }
+    return ret;
 }
 
 /* Copies the 'n_bits' low-order bits of 'value' into the 'n_bits' bits
@@ -2041,6 +2237,52 @@ xsleep(unsigned int seconds)
     ovsrcu_quiesce_end();
 }
 
+/* High resolution sleep. */
+void
+xnanosleep(uint64_t nanoseconds)
+{
+    ovsrcu_quiesce_start();
+#ifndef _WIN32
+    int retval;
+    struct timespec ts_sleep;
+    nsec_to_timespec(nanoseconds, &ts_sleep);
+
+    int error = 0;
+    do {
+        retval = nanosleep(&ts_sleep, NULL);
+        error = retval < 0 ? errno : 0;
+    } while (error == EINTR);
+#else
+    HANDLE timer = CreateWaitableTimer(NULL, FALSE, NULL);
+    if (timer) {
+        LARGE_INTEGER duetime;
+        duetime.QuadPart = -nanoseconds;
+        if (SetWaitableTimer(timer, &duetime, 0, NULL, NULL, FALSE)) {
+            WaitForSingleObject(timer, INFINITE);
+        } else {
+            VLOG_ERR_ONCE("SetWaitableTimer Failed (%s)",
+                           ovs_lasterror_to_string());
+        }
+        CloseHandle(timer);
+    } else {
+        VLOG_ERR_ONCE("CreateWaitableTimer Failed (%s)",
+                       ovs_lasterror_to_string());
+    }
+#endif
+    ovsrcu_quiesce_end();
+}
+
+/* Determine whether standard output is a tty or not. This is useful to decide
+ * whether to use color output or not when --color option for utilities is set
+ * to `auto`.
+ */
+bool
+is_stdout_a_tty(void)
+{
+    char const *t = getenv("TERM");
+    return (isatty(STDOUT_FILENO) && t && strcmp(t, "dumb") != 0);
+}
+
 #ifdef _WIN32
 
 char *
@@ -2048,6 +2290,11 @@ ovs_format_message(int error)
 {
     enum { BUFSIZE = sizeof strerror_buffer_get()->s };
     char *buffer = strerror_buffer_get()->s;
+
+    if (error == 0) {
+        /* See ovs_strerror */
+        return "Success";
+    }
 
     FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                   NULL, error, 0, buffer, BUFSIZE, NULL);

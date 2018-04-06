@@ -19,7 +19,8 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
+#include "random.h"
 #include "util.h"
 #include "openvswitch/vlog.h"
 
@@ -127,7 +128,9 @@ compare_strings(const void *a_, const void *b_)
 void
 svec_sort(struct svec *svec)
 {
-    qsort(svec->names, svec->n, sizeof *svec->names, compare_strings);
+    if (svec->n) {
+        qsort(svec->names, svec->n, sizeof *svec->names, compare_strings);
+    }
 }
 
 void
@@ -170,6 +173,23 @@ svec_compact(struct svec *svec)
         }
     }
     svec->n = j;
+}
+
+static void
+swap_strings(char **a, char **b)
+{
+    char *tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+void
+svec_shuffle(struct svec *svec)
+{
+    for (size_t i = 0; i < svec->n; i++) {
+        size_t j = i + random_range(svec->n - i);
+        swap_strings(&svec->names[i], &svec->names[j]);
+    }
 }
 
 void

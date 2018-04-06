@@ -3,7 +3,6 @@
 
 #include <openflow/openflow-common.h>
 #include "util.h"
-#include "ofp-util.h"
 
 #define OFP_VERSION_LONG_OPTIONS                                \
         {"version",     no_argument, NULL, 'V'},                \
@@ -11,7 +10,7 @@
 
 #define OFP_VERSION_OPTION_HANDLERS                             \
         case 'V':                                               \
-            ovs_print_version(OFP10_VERSION, OFP13_VERSION);    \
+            ovs_print_version(OFP10_VERSION, OFP14_VERSION);    \
             exit(EXIT_SUCCESS);                                 \
                                                                 \
         case 'O':                                               \

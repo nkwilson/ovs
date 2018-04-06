@@ -15,6 +15,7 @@
  */
 
 #include "precomp.h"
+#include "Recirc.h"
 #ifdef OVS_DBG_MOD
 #undef OVS_DBG_MOD
 #endif
@@ -24,10 +25,10 @@
 
 extern NDIS_HANDLE gOvsExtDriverHandle;
 
+_Use_decl_annotations_
 VOID*
 OvsAllocateMemoryWithTag(size_t size, ULONG tag)
 {
-    OVS_VERIFY_IRQL_LE(DISPATCH_LEVEL);
     return NdisAllocateMemoryWithTagPriority(gOvsExtDriverHandle,
         (UINT32)size, tag, NormalPoolPriority);
 }
@@ -39,19 +40,18 @@ OvsFreeMemoryWithTag(VOID *ptr, ULONG tag)
     NdisFreeMemoryWithTagPriority(gOvsExtDriverHandle, ptr, tag);
 }
 
+_Use_decl_annotations_
 VOID *
 OvsAllocateMemory(size_t size)
 {
-    OVS_VERIFY_IRQL_LE(DISPATCH_LEVEL);
     return NdisAllocateMemoryWithTagPriority(gOvsExtDriverHandle,
         (UINT32)size, OVS_MEMORY_TAG, NormalPoolPriority);
 }
 
+_Use_decl_annotations_
 VOID *
 OvsAllocateAlignedMemory(size_t size, UINT16 align)
 {
-    OVS_VERIFY_IRQL_LE(DISPATCH_LEVEL);
-
     ASSERT((align == 8) || (align == 16));
 
     if ((align == 8) || (align == 16)) {
@@ -59,7 +59,7 @@ OvsAllocateAlignedMemory(size_t size, UINT16 align)
          * XXX: NdisAllocateMemory*() functions don't talk anything about
          * alignment. Hence using ExAllocatePool*();
          */
-        return (VOID *)ExAllocatePoolWithTagPriority(NonPagedPool, size,
+        return (VOID *)ExAllocatePoolWithTagPriority(NonPagedPoolNx, size,
                                                      OVS_MEMORY_TAG,
                                                      NormalPoolPriority);
     }
@@ -115,4 +115,49 @@ OvsCompareString(PVOID string1, PVOID string2)
     RtlInitString(&str1, string1);
     RtlInitString(&str2, string2);
     return RtlEqualString(&str1, &str2, FALSE);
+}
+
+VOID *
+OvsAllocateMemoryPerCpu(size_t size,
+                        size_t count,
+                        ULONG tag)
+{
+    VOID *ptr = NULL;
+
+    ASSERT(KeQueryActiveGroupCount() == 1);
+
+    if (!count) {
+        count = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    }
+
+    ptr = OvsAllocateMemoryWithTag(count * size, tag);
+    if (ptr) {
+        RtlZeroMemory(ptr, count * size);
+    }
+
+    return ptr;
+}
+
+/*
+ * --------------------------------------------------------------------------
+ * OvsPerCpuDataInit --
+ *     The function allocates necessary per-processor resources.
+ * --------------------------------------------------------------------------
+ */
+NTSTATUS
+OvsPerCpuDataInit()
+{
+    return OvsDeferredActionsInit();
+}
+
+/*
+ * --------------------------------------------------------------------------
+ * OvsPerCpuDataCleanup --
+ *     The function frees all per-processor resources.
+ * --------------------------------------------------------------------------
+ */
+VOID
+OvsPerCpuDataCleanup()
+{
+    OvsDeferredActionsCleanup();
 }

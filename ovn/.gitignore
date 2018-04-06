@@ -5,5 +5,4 @@
 /ovn-sb.5
 /ovn-sb.gv
 /ovn-sb.pic
-/ovn-nbctl
-/ovn-nbctl.8
+/*.ovsschema.stamp

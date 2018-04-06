@@ -39,6 +39,13 @@
 
 #include <openflow/openflow-common.h>
 
+/* Body for ofp15_multipart_request of type OFPMP_PORT_DESC. */
+struct ofp15_port_desc_request {
+    ovs_be32 port_no;         /* All ports if OFPP_ANY. */
+    uint8_t pad[4];            /* Align to 64 bits. */
+};
+OFP_ASSERT(sizeof(struct ofp15_port_desc_request) == 8);
+
 /* Group commands */
 enum ofp15_group_mod_command {
     /* Present since OpenFlow 1.1 - 1.4 */
@@ -52,6 +59,7 @@ enum ofp15_group_mod_command {
     /* OFPGCXX_YYY = 4, */    /* Reserved for future use. */
     OFPGC15_REMOVE_BUCKET = 5,/* Remove all action buckets or any specific
                                  action bucket from matching group */
+    OFPGC15_ADD_OR_MOD = 0x8000, /* Create new or modify existing group. */
 };
 
 /* Group bucket property types.  */
@@ -61,24 +69,6 @@ enum ofp15_group_bucket_prop_type {
     OFPGBPT15_WATCH_GROUP            = 2,  /* Fast failover groups only. */
     OFPGBPT15_EXPERIMENTER      = 0xFFFF,  /* Experimenter defined. */
 };
-
-/* Group bucket weight property, for select groups only. */
-struct ofp15_group_bucket_prop_weight {
-    ovs_be16         type;    /* OFPGBPT15_WEIGHT. */
-    ovs_be16         length;  /* 8. */
-    ovs_be16         weight;  /* Relative weight of bucket. */
-    uint8_t          pad[2];  /* Pad to 64 bits. */
-};
-OFP_ASSERT(sizeof(struct ofp15_group_bucket_prop_weight) == 8);
-
-/* Group bucket watch port or watch group property, for fast failover groups
- * only. */
-struct ofp15_group_bucket_prop_watch {
-    ovs_be16         type;    /* OFPGBPT15_WATCH_PORT or OFPGBPT15_WATCH_GROUP. */
-    ovs_be16         length;  /* 8. */
-    ovs_be32         watch;   /* The port or the group.  */
-};
-OFP_ASSERT(sizeof(struct ofp15_group_bucket_prop_watch) == 8);
 
 /* Bucket for use in groups. */
 struct ofp15_bucket {
@@ -137,6 +127,13 @@ struct ofp15_group_mod {
 };
 OFP_ASSERT(sizeof(struct ofp15_group_mod) == 16);
 
+/* Body for ofp15_multipart_request of type OFPMP_GROUP_DESC. */
+struct ofp15_group_desc_request {
+    ovs_be32 group_id;         /* All groups if OFPG_ALL. */
+    uint8_t pad[4];            /* Align to 64 bits. */
+};
+OFP_ASSERT(sizeof(struct ofp15_group_desc_request) == 8);
+
 /* Body of reply to OFPMP_GROUP_DESC request. */
 struct ofp15_group_desc_stats {
     ovs_be16 length;              /* Length of this entry. */
@@ -152,5 +149,18 @@ struct ofp15_group_desc_stats {
      *     length in header.length. */
 };
 OFP_ASSERT(sizeof(struct ofp15_group_desc_stats) == 16);
+
+/* Send packet (controller -> datapath). */
+struct ofp15_packet_out {
+    ovs_be32 buffer_id;         /* ID assigned by datapath (-1 if none). */
+    ovs_be16 actions_len;       /* Size of action array in bytes. */
+    uint8_t pad[2];
+    /* Followed by:
+     *   - Match
+     *   - List of actions
+     *   - Packet data
+     */
+};
+OFP_ASSERT(sizeof(struct ofp15_packet_out) == 8);
 
 #endif /* openflow/openflow-1.5.h */

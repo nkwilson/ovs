@@ -1,4 +1,4 @@
-# Copyright (C) 2009, 2010, 2011, 2012, 2014 Nicira, Inc.
+# Copyright (C) 2009, 2010, 2011, 2012, 2014, 2016 Nicira, Inc.
 #
 # Copying and distribution of this file, with or without modification,
 # are permitted in any medium without royalty provided the copyright
@@ -7,7 +7,7 @@
 
 lib_LTLIBRARIES += ofproto/libofproto.la
 ofproto_libofproto_la_LDFLAGS = \
-        -version-info $(LT_CURRENT):$(LT_REVISION):$(LT_AGE) \
+        $(OVS_LTINFO) \
         -Wl,--version-script=$(top_builddir)/ofproto/libofproto.sym \
         $(AM_LDFLAGS)
 ofproto_libofproto_la_SOURCES = \
@@ -38,13 +38,15 @@ ofproto_libofproto_la_SOURCES = \
 	ofproto/ofproto-dpif-rid.h \
 	ofproto/ofproto-dpif-sflow.c \
 	ofproto/ofproto-dpif-sflow.h \
+	ofproto/ofproto-dpif-trace.c \
+	ofproto/ofproto-dpif-trace.h \
 	ofproto/ofproto-dpif-upcall.c \
 	ofproto/ofproto-dpif-upcall.h \
 	ofproto/ofproto-dpif-xlate.c \
 	ofproto/ofproto-dpif-xlate.h \
 	ofproto/ofproto-provider.h \
-	ofproto/pktbuf.c \
-	ofproto/pktbuf.h \
+	ofproto/ofproto-dpif-xlate-cache.c \
+	ofproto/ofproto-dpif-xlate-cache.h \
 	ofproto/pinsched.c \
 	ofproto/pinsched.h \
 	ofproto/tunnel.c \
@@ -60,7 +62,7 @@ ofproto_libofproto_la_LIBADD += ${PTHREAD_LIBS}
 endif
 
 pkgconfig_DATA += \
-	$(srcdir)/ofproto/libofproto.pc
+	ofproto/libofproto.pc
 
 # Distribute this generated file in order not to require Python at
 # build time if ofproto/ipfix.xml is not modified.
@@ -82,3 +84,5 @@ ofproto/ipfix-entities.def: ofproto/ipfix.xml ofproto/ipfix-gen-entities
 
 # IPFIX enterprise entity definition macros.
 EXTRA_DIST += ofproto/ipfix-enterprise-entities.def
+
+FLAKE8_PYFILES += ofproto/ipfix-gen-entities

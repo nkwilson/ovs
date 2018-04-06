@@ -24,31 +24,29 @@
 #include "byte-order.h"
 #include "connectivity.h"
 #include "dp-packet.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "flow.h"
 #include "hash.h"
-#include "hmap.h"
+#include "openvswitch/hmap.h"
 #include "netdev.h"
 #include "ovs-atomic.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "random.h"
 #include "seq.h"
 #include "timer.h"
 #include "timeval.h"
 #include "unixctl.h"
 #include "openvswitch/vlog.h"
+#include "util.h"
 
 VLOG_DEFINE_THIS_MODULE(cfm);
 
 #define CFM_MAX_RMPS 256
 
 /* Ethernet destination address of CCM packets. */
-static const uint8_t eth_addr_ccm[ETH_ADDR_LEN] = {
-    0x01, 0x80, 0xC2, 0x00, 0x00, 0x30 };
-static const uint8_t eth_addr_ccm_x[ETH_ADDR_LEN] = {
-    0x01, 0x23, 0x20, 0x00, 0x00, 0x30
-};
+static const struct eth_addr eth_addr_ccm = ETH_ADDR_C(01,80,c2,00,00,30);
+static const struct eth_addr eth_addr_ccm_x = ETH_ADDR_C(01,23,20,00,00,30);
 
 #define ETH_TYPE_CFM 0x8902
 
@@ -185,7 +183,7 @@ cfm_rx_packets(const struct cfm *cfm) OVS_REQUIRES(mutex)
     }
 }
 
-static const uint8_t *
+static struct eth_addr
 cfm_ccm_addr(struct cfm *cfm)
 {
     bool extended;
@@ -375,7 +373,7 @@ cfm_create(const struct netdev *netdev) OVS_EXCLUDED(mutex)
 void
 cfm_unref(struct cfm *cfm) OVS_EXCLUDED(mutex)
 {
-    struct remote_mp *rmp, *rmp_next;
+    struct remote_mp *rmp;
 
     if (!cfm) {
         return;
@@ -390,8 +388,7 @@ cfm_unref(struct cfm *cfm) OVS_EXCLUDED(mutex)
     hmap_remove(all_cfms, &cfm->hmap_node);
     ovs_mutex_unlock(&mutex);
 
-    HMAP_FOR_EACH_SAFE (rmp, rmp_next, node, &cfm->remote_mps) {
-        hmap_remove(&cfm->remote_mps, &rmp->node);
+    HMAP_FOR_EACH_POP (rmp, node, &cfm->remote_mps) {
         free(rmp);
     }
 
@@ -565,7 +562,7 @@ cfm_should_send_ccm(struct cfm *cfm) OVS_EXCLUDED(mutex)
  * should be sent whenever cfm_should_send_ccm() indicates. */
 void
 cfm_compose_ccm(struct cfm *cfm, struct dp_packet *packet,
-                const uint8_t eth_src[ETH_ADDR_LEN]) OVS_EXCLUDED(mutex)
+                const struct eth_addr eth_src) OVS_EXCLUDED(mutex)
 {
     uint16_t ccm_vlan;
     struct ccm *ccm;
@@ -761,7 +758,7 @@ cfm_process_heartbeat(struct cfm *cfm, const struct dp_packet *p)
 
     atomic_read_relaxed(&cfm->extended, &extended);
 
-    eth = dp_packet_l2(p);
+    eth = dp_packet_eth(p);
     ccm = dp_packet_at(p, (uint8_t *)dp_packet_l3(p) - (uint8_t *)dp_packet_data(p),
                     CCM_ACCEPT_LEN);
 

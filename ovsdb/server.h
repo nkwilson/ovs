@@ -16,9 +16,10 @@
 #ifndef SERVER_H
 #define SERVER_H 1
 
-#include "hmap.h"
-#include "list.h"
-#include "shash.h"
+#include "openvswitch/hmap.h"
+#include "openvswitch/list.h"
+#include "openvswitch/shash.h"
+#include "openvswitch/uuid.h"
 
 struct ovsdb;
 struct ovsdb_server;
@@ -79,11 +80,13 @@ bool ovsdb_lock_waiter_is_owner(const struct ovsdb_lock_waiter *);
 struct ovsdb_server {
     struct shash dbs;      /* Maps from a db name to a "struct ovsdb *". */
     struct hmap locks;     /* Contains "struct ovsdb_lock"s indexed by name. */
+    struct uuid uuid;      /* Server ID. Generated every time a server is
+                              launched.  */
 };
 
 void ovsdb_server_init(struct ovsdb_server *);
 bool ovsdb_server_add_db(struct ovsdb_server *, struct ovsdb *);
-bool ovsdb_server_remove_db(struct ovsdb_server *, struct ovsdb *);
+void ovsdb_server_remove_db(struct ovsdb_server *, struct ovsdb *);
 void ovsdb_server_destroy(struct ovsdb_server *);
 
 struct ovsdb_lock_waiter *ovsdb_server_lock(struct ovsdb_server *,

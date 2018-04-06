@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,9 +24,9 @@
 #include <stdlib.h>
 #include "command-line.h"
 #include "daemon.h"
-#include "json.h"
+#include "openvswitch/json.h"
 #include "ovstest.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "stream-ssl.h"
 #include "stream.h"
 #include "timeval.h"
@@ -55,7 +55,8 @@ parse_options(int argc, char *argv[])
 {
     enum {
         OPT_BOOTSTRAP_CA_CERT = UCHAR_MAX + 1,
-        DAEMON_OPTION_ENUMS
+        DAEMON_OPTION_ENUMS,
+        SSL_OPTION_ENUMS,
     };
     static const struct option long_options[] = {
         {"verbose", optional_argument, NULL, 'v'},
@@ -331,11 +332,11 @@ do_help(struct ovs_cmdl_context *ctx OVS_UNUSED)
 }
 
 static struct ovs_cmdl_command all_commands[] = {
-    { "listen", NULL, 1, 1, do_listen },
-    { "request", NULL, 3, 3, do_request },
-    { "notify", NULL, 3, 3, do_notify },
-    { "help", NULL, 0, INT_MAX, do_help },
-    { NULL, NULL, 0, 0, NULL },
+    { "listen", NULL, 1, 1, do_listen, OVS_RO },
+    { "request", NULL, 3, 3, do_request, OVS_RO },
+    { "notify", NULL, 3, 3, do_notify, OVS_RO },
+    { "help", NULL, 0, INT_MAX, do_help, OVS_RO },
+    { NULL, NULL, 0, 0, NULL, OVS_RO },
 };
 
 static struct ovs_cmdl_command *

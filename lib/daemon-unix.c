@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2015 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@
 #include "daemon-private.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,9 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if HAVE_LIBCAPNG
+#include <cap-ng.h>
+#endif
 #include "command-line.h"
 #include "fatal-signal.h"
 #include "dirs.h"
@@ -38,6 +43,18 @@
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(daemon_unix);
+
+#ifdef __linux__
+#define LINUX 1
+#else
+#define LINUX 0
+#endif
+
+#if HAVE_LIBCAPNG
+#define LIBCAPNG 1
+#else
+#define LIBCAPNG 0
+#endif
 
 /* --detach: Should we run in the background? */
 bool detach;                    /* Was --detach specified? */
@@ -63,6 +80,14 @@ static int daemonize_fd = -1;
 /* --monitor: Should a supervisory process monitor the daemon and restart it if
  * it dies due to an error signal? */
 static bool monitor;
+
+/* --user: Only root can use this option. Switch to new uid:gid after
+ * initially running as root.  */
+static bool switch_user = false;
+static uid_t uid;
+static gid_t gid;
+static char *user = NULL;
+static void daemon_become_new_user__(bool access_datapath);
 
 static void check_already_running(void);
 static int lock_pidfile(FILE *, int command);
@@ -336,11 +361,14 @@ monitor_daemon(pid_t daemon_pid)
                                (unsigned long int) daemon_pid, status_msg);
 
         if (child_ready) {
+            int error;
             do {
                 retval = waitpid(daemon_pid, &status, 0);
-            } while (retval == -1 && errno == EINTR);
-            if (retval == -1) {
-                VLOG_FATAL("waitpid failed (%s)", ovs_strerror(errno));
+                error = retval == -1 ? errno : 0;
+            } while (error == EINTR);
+            vlog_reopen_log_file();
+            if (error) {
+                VLOG_FATAL("waitpid failed (%s)", ovs_strerror(error));
             }
         }
 
@@ -409,10 +437,15 @@ monitor_daemon(pid_t daemon_pid)
  * daemon_complete()) or that it failed to start up (by exiting with a nonzero
  * exit code). */
 void
-daemonize_start(void)
+daemonize_start(bool access_datapath)
 {
     assert_single_threaded();
     daemonize_fd = -1;
+
+    if (switch_user) {
+        daemon_become_new_user__(access_datapath);
+        switch_user = false;
+    }
 
     if (detach) {
         pid_t pid;
@@ -439,7 +472,9 @@ daemonize_start(void)
         if (daemon_pid > 0) {
             /* Running in monitor process. */
             fork_notify_startup(saved_daemonize_fd);
-            close_standard_fds();
+            if (detach) {
+                close_standard_fds();
+            }
             monitor_daemon(daemon_pid);
         }
         /* Running in daemon process. */
@@ -502,6 +537,8 @@ daemon_usage(void)
     printf(
         "\nDaemon options:\n"
         "  --detach                run in background as daemon\n"
+        "  --monitor               creates a process to monitor this daemon\n"
+        "  --user=username[:group] changes the effective daemon user:group\n"
         "  --no-chdir              do not chdir to '/'\n"
         "  --pidfile[=FILE]        create pidfile (default: %s/%s.pid)\n"
         "  --overwrite-pidfile     with --pidfile, start even if already "
@@ -535,7 +572,7 @@ lock_pidfile(FILE *file, int command)
 }
 
 static pid_t
-read_pidfile__(const char *pidfile, bool delete_if_stale)
+read_pidfile__(const char *pidfile_, bool delete_if_stale)
 {
     struct stat s, s2;
     struct flock lck;
@@ -544,7 +581,7 @@ read_pidfile__(const char *pidfile, bool delete_if_stale)
     int error;
 
     if ((pidfile_ino || pidfile_dev)
-        && !stat(pidfile, &s)
+        && !stat(pidfile_, &s)
         && s.st_ino == pidfile_ino && s.st_dev == pidfile_dev) {
         /* It's our own pidfile.  We can't afford to open it, because closing
          * *any* fd for a file that a process has locked also releases all the
@@ -554,19 +591,19 @@ read_pidfile__(const char *pidfile, bool delete_if_stale)
         return getpid();
     }
 
-    file = fopen(pidfile, "r+");
+    file = fopen(pidfile_, "r+");
     if (!file) {
         if (errno == ENOENT && delete_if_stale) {
             return 0;
         }
         error = errno;
-        VLOG_WARN("%s: open: %s", pidfile, ovs_strerror(error));
+        VLOG_WARN("%s: open: %s", pidfile_, ovs_strerror(error));
         goto error;
     }
 
     error = lock_pidfile__(file, F_GETLK, &lck);
     if (error) {
-        VLOG_WARN("%s: fcntl: %s", pidfile, ovs_strerror(error));
+        VLOG_WARN("%s: fcntl: %s", pidfile_, ovs_strerror(error));
         goto error;
     }
     if (lck.l_type == F_UNLCK) {
@@ -579,7 +616,7 @@ read_pidfile__(const char *pidfile, bool delete_if_stale)
          * pidfile locked, and only that process has the right to unlink it. */
         if (!delete_if_stale) {
             error = ESRCH;
-            VLOG_DBG("%s: pid file is stale", pidfile);
+            VLOG_DBG("%s: pid file is stale", pidfile_);
             goto error;
         }
 
@@ -587,28 +624,28 @@ read_pidfile__(const char *pidfile, bool delete_if_stale)
         error = lock_pidfile(file, F_SETLK);
         if (error) {
             /* We lost a race with someone else doing the same thing. */
-            VLOG_WARN("%s: lost race to lock pidfile", pidfile);
+            VLOG_WARN("%s: lost race to lock pidfile", pidfile_);
             goto error;
         }
 
-        /* Is the file we have locked still named 'pidfile'? */
-        if (stat(pidfile, &s) || fstat(fileno(file), &s2)
+        /* Is the file we have locked still named 'pidfile_'? */
+        if (stat(pidfile_, &s) || fstat(fileno(file), &s2)
             || s.st_ino != s2.st_ino || s.st_dev != s2.st_dev) {
             /* No.  We lost a race with someone else who got the lock before
              * us, deleted the pidfile, and closed it (releasing the lock). */
             error = EALREADY;
-            VLOG_WARN("%s: lost race to delete pidfile", pidfile);
+            VLOG_WARN("%s: lost race to delete pidfile", pidfile_);
             goto error;
         }
 
         /* We won the right to delete the stale pidfile. */
-        if (unlink(pidfile)) {
+        if (unlink(pidfile_)) {
             error = errno;
             VLOG_WARN("%s: failed to delete stale pidfile (%s)",
-                      pidfile, ovs_strerror(error));
+                      pidfile_, ovs_strerror(error));
             goto error;
         }
-        VLOG_DBG("%s: deleted stale pidfile", pidfile);
+        VLOG_DBG("%s: deleted stale pidfile", pidfile_);
         fclose(file);
         return 0;
     }
@@ -616,10 +653,10 @@ read_pidfile__(const char *pidfile, bool delete_if_stale)
     if (!fgets(line, sizeof line, file)) {
         if (ferror(file)) {
             error = errno;
-            VLOG_WARN("%s: read: %s", pidfile, ovs_strerror(error));
+            VLOG_WARN("%s: read: %s", pidfile_, ovs_strerror(error));
         } else {
             error = ESRCH;
-            VLOG_WARN("%s: read: unexpected end of file", pidfile);
+            VLOG_WARN("%s: read: unexpected end of file", pidfile_);
         }
         goto error;
     }
@@ -630,7 +667,7 @@ read_pidfile__(const char *pidfile, bool delete_if_stale)
          * preparing to delete it. */
         error = ESRCH;
         VLOG_WARN("%s: stale pidfile for pid %s being deleted by pid %ld",
-                  pidfile, line, (long int) lck.l_pid);
+                  pidfile_, line, (long int) lck.l_pid);
         goto error;
     }
 
@@ -644,12 +681,12 @@ error:
     return -error;
 }
 
-/* Opens and reads a PID from 'pidfile'.  Returns the positive PID if
+/* Opens and reads a PID from 'pidfile_'.  Returns the positive PID if
  * successful, otherwise a negative errno value. */
 pid_t
-read_pidfile(const char *pidfile)
+read_pidfile(const char *pidfile_)
 {
-    return read_pidfile__(pidfile, false);
+    return read_pidfile__(pidfile_, false);
 }
 
 /* Checks whether a process with the given 'pidfile' is already running and,
@@ -683,4 +720,333 @@ bool
 should_service_stop(void)
 {
     return false;
+}
+
+
+static bool
+gid_matches(gid_t expected, gid_t value)
+{
+    return expected == -1 || expected == value;
+}
+
+static bool
+gid_verify(gid_t gid_)
+{
+    gid_t r, e;
+
+    r = getgid();
+    e = getegid();
+    return (gid_matches(gid_, r) &&
+            gid_matches(gid_, e));
+}
+
+static void
+daemon_switch_group(gid_t gid_)
+{
+    if ((setgid(gid_) == -1) || !gid_verify(gid_)) {
+        VLOG_FATAL("%s: fail to switch group to gid as %d, aborting",
+                   pidfile, gid_);
+    }
+}
+
+static bool
+uid_matches(uid_t expected, uid_t value)
+{
+    return expected == -1 || expected == value;
+}
+
+static bool
+uid_verify(const uid_t uid_)
+{
+    uid_t r, e;
+
+    r = getuid();
+    e = geteuid();
+    return (uid_matches(uid_, r) &&
+            uid_matches(uid_, e));
+}
+
+static void
+daemon_switch_user(const uid_t uid_, const char *user_)
+{
+    if ((setuid(uid_) == -1) || !uid_verify(uid_)) {
+        VLOG_FATAL("%s: fail to switch user to %s, aborting",
+                   pidfile, user_);
+    }
+}
+
+/* Use portable Unix APIs to switch uid:gid, when datapath
+ * access is not required.  On Linux systems, all capabilities
+ * will be dropped.  */
+static void
+daemon_become_new_user_unix(void)
+{
+    /* "Setuid Demystified" by Hao Chen, etc outlines some caveats of
+     * around unix system call setuid() and friends. This implementation
+     * mostly follow the advice given by the paper.  The paper is
+     * published in 2002, so things could have changed.  */
+
+    /* Change both real and effective uid and gid will permanently
+     * drop the process' privilege.  "Setuid Demystified" suggested
+     * that calling getuid() after each setuid() call to verify they
+     * are actually set, because checking return code alone is not
+     * sufficient.  */
+    daemon_switch_group(gid);
+    if (user && initgroups(user, gid) == -1) {
+        VLOG_FATAL("%s: fail to add supplementary group gid %d, "
+                   "aborting", pidfile, gid);
+    }
+    daemon_switch_user(uid, user);
+}
+
+/* Linux specific implementation of daemon_become_new_user()
+ * using libcap-ng.   */
+static void
+daemon_become_new_user_linux(bool access_datapath OVS_UNUSED)
+{
+#if defined __linux__ &&  HAVE_LIBCAPNG
+    int ret;
+
+    ret = capng_get_caps_process();
+
+    if (!ret) {
+        if (capng_have_capabilities(CAPNG_SELECT_CAPS) > CAPNG_NONE) {
+            const capng_type_t cap_sets = CAPNG_EFFECTIVE|CAPNG_PERMITTED;
+
+            capng_clear(CAPNG_SELECT_BOTH);
+
+            ret = capng_update(CAPNG_ADD, cap_sets, CAP_IPC_LOCK)
+                  || capng_update(CAPNG_ADD, cap_sets, CAP_NET_BIND_SERVICE);
+
+            if (access_datapath && !ret) {
+                ret = capng_update(CAPNG_ADD, cap_sets, CAP_NET_ADMIN)
+                      || capng_update(CAPNG_ADD, cap_sets, CAP_NET_RAW)
+                      || capng_update(CAPNG_ADD, cap_sets, CAP_NET_BROADCAST);
+            }
+        } else {
+            ret = -1;
+        }
+    }
+
+    if (!ret) {
+        /* CAPNG_INIT_SUPP_GRP will be a better choice than
+         * CAPNG_DROP_SUPP_GRP. However this enum value is only defined
+         * with libcap-ng higher than version 0.7.4, which is not wildly
+         * available on many Linux distributions yet. Taking a more
+         * conservative approach to make sure OVS behaves consistently.
+         *
+         * XXX We may change this for future OVS releases.
+         */
+        ret = capng_change_id(uid, gid, CAPNG_DROP_SUPP_GRP
+                              | CAPNG_CLEAR_BOUNDING);
+    }
+
+    if (ret) {
+        VLOG_FATAL("%s: libcap-ng fail to switch to user and group "
+                   "%d:%d, aborting", pidfile, uid, gid);
+    }
+#endif
+}
+
+static void
+daemon_become_new_user__(bool access_datapath)
+{
+    /* If vlog file has been created, change its owner to the non-root user
+     * as specifed by the --user option.  */
+    vlog_change_owner_unix(uid, gid);
+
+    if (LINUX) {
+        if (LIBCAPNG) {
+            daemon_become_new_user_linux(access_datapath);
+        } else {
+            VLOG_FATAL("%s: fail to downgrade user using libcap-ng. "
+                       "(libcap-ng is not configured at compile time), "
+                       "aborting.", pidfile);
+        }
+    } else {
+        daemon_become_new_user_unix();
+    }
+}
+
+/* Noramlly, user switch is embedded within daemonize_start().
+ * However, there in case the user switch needs to be done
+ * before daemonize_start(), the following API can be used.  */
+void
+daemon_become_new_user(bool access_datapath)
+{
+    assert_single_threaded();
+    if (switch_user) {
+        daemon_become_new_user__(access_datapath);
+        /* daemonize_start() should not switch user again. */
+        switch_user = false;
+    }
+}
+
+/* Return the maximun suggested buffer size for both getpwname_r()
+ * and getgrnam_r().
+ *
+ * This size may still not be big enough. in case getpwname_r()
+ * and friends return ERANGE, a larger buffer should be supplied to
+ * retry. (The man page did not specify the max size to stop at, we
+ * will keep trying with doubling the buffer size for each round until
+ * the size wrapps around size_t.  */
+static size_t
+get_sysconf_buffer_size(void)
+{
+    size_t bufsize, pwd_bs = 0, grp_bs = 0;
+    const size_t default_bufsize = 1024;
+
+    errno = 0;
+    if ((pwd_bs = sysconf(_SC_GETPW_R_SIZE_MAX)) == -1) {
+        if (errno) {
+            VLOG_FATAL("%s: Read initial passwordd struct size "
+                       "failed (%s), aborting. ", pidfile,
+                       ovs_strerror(errno));
+        }
+    }
+
+    if ((grp_bs = sysconf(_SC_GETGR_R_SIZE_MAX)) == -1) {
+        if (errno) {
+            VLOG_FATAL("%s: Read initial group struct size "
+                       "failed (%s), aborting. ", pidfile,
+                       ovs_strerror(errno));
+        }
+    }
+
+    bufsize = MAX(pwd_bs, grp_bs);
+    return bufsize ? bufsize : default_bufsize;
+}
+
+/* Try to double the size of '*buf', return true
+ * if successful, and '*sizep' will be updated with
+ * the new size. Otherwise, return false.  */
+static bool
+enlarge_buffer(char **buf, size_t *sizep)
+{
+    size_t newsize = *sizep * 2;
+
+    if (newsize > *sizep) {
+        *buf = xrealloc(*buf, newsize);
+        *sizep = newsize;
+        return true;
+    }
+
+    return false;
+}
+
+/* Parse and sanity check user_spec.
+ *
+ * If successful, set global variables 'uid' and 'gid'
+ * with the parsed results. Global variable 'user'
+ * will be pointing to a string that stores the name
+ * of the user to be switched into.
+ *
+ * Also set 'switch_to_new_user' to true, The actual
+ * user switching is done as soon as daemonize_start()
+ * is called. I/O access before calling daemonize_start()
+ * will still be with root's credential.  */
+void
+daemon_set_new_user(const char *user_spec)
+{
+    char *pos = strchr(user_spec, ':');
+    size_t init_bufsize, bufsize;
+
+    init_bufsize = get_sysconf_buffer_size();
+    uid = getuid();
+    gid = getgid();
+
+    if (geteuid() || uid) {
+        VLOG_FATAL("%s: only root can use --user option", pidfile);
+    }
+
+    user_spec += strspn(user_spec, " \t\r\n");
+    size_t len = pos ? pos - user_spec : strlen(user_spec);
+    char *buf;
+    struct passwd pwd, *res;
+    int e;
+
+    bufsize = init_bufsize;
+    buf = xmalloc(bufsize);
+    if (len) {
+        user = xmemdup0(user_spec, len);
+
+        while ((e = getpwnam_r(user, &pwd, buf, bufsize, &res)) == ERANGE) {
+            if (!enlarge_buffer(&buf, &bufsize)) {
+                break;
+            }
+        }
+
+        if (e != 0) {
+            VLOG_FATAL("%s: Failed to retrive user %s's uid (%s), aborting.",
+                       pidfile, user, ovs_strerror(e));
+        }
+        if (res == NULL) {
+            VLOG_FATAL("%s: user %s not found, aborting.", pidfile, user);
+        }
+    } else {
+        /* User name is not specified, use current user.  */
+        while ((e = getpwuid_r(uid, &pwd, buf, bufsize, &res)) == ERANGE) {
+            if (!enlarge_buffer(&buf, &bufsize)) {
+                break;
+            }
+        }
+
+        if (e != 0) {
+            VLOG_FATAL("%s: Failed to retrive current user's name "
+                       "(%s), aborting.", pidfile, ovs_strerror(e));
+        }
+        user = xstrdup(pwd.pw_name);
+    }
+
+    uid = pwd.pw_uid;
+    gid = pwd.pw_gid;
+    free(buf);
+
+    if (pos) {
+        char *grpstr = pos + 1;
+        grpstr += strspn(grpstr, " \t\r\n");
+
+        if (*grpstr) {
+            struct group grp, *gres;
+
+            bufsize = init_bufsize;
+            buf = xmalloc(bufsize);
+            while ((e = getgrnam_r(grpstr, &grp, buf, bufsize, &gres))
+                         == ERANGE) {
+                if (!enlarge_buffer(&buf, &bufsize)) {
+                    break;
+                }
+            }
+
+            if (e) {
+                VLOG_FATAL("%s: Failed to get group entry for %s, "
+                           "(%s), aborting.", pidfile, grpstr,
+                           ovs_strerror(e));
+            }
+            if (gres == NULL) {
+                VLOG_FATAL("%s: group %s not found, aborting.", pidfile,
+                           grpstr);
+            }
+
+            if (gid != grp.gr_gid) {
+                char **mem;
+
+                for (mem = grp.gr_mem; *mem; ++mem) {
+                    if (!strcmp(*mem, user)) {
+                        break;
+                    }
+                }
+
+                if (!*mem) {
+                    VLOG_FATAL("%s: Invalid --user option %s (user %s is "
+                               "not in group %s), aborting.", pidfile,
+                               user_spec, user, grpstr);
+                }
+                gid = grp.gr_gid;
+            }
+            free(buf);
+        }
+    }
+
+    switch_user = true;
 }

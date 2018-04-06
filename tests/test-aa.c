@@ -26,11 +26,11 @@
 #define ETH_TYPE_LLDP   0x88cc
 
 /* Dummy MAC addresses */
-static uint8_t chassis_mac[ETH_ADDR_LEN] = { 0x5e, 0x10, 0x8e, 0xe7, 0x84, 0xad };
-static uint8_t eth_src[ETH_ADDR_LEN] = { 0x5e, 0x10, 0x8e, 0xe7, 0x84, 0xad };
+static const struct eth_addr chassis_mac = ETH_ADDR_C(5e,10,8e,e7,84,ad);
+static const struct eth_addr eth_src = ETH_ADDR_C(5e,10,8e,e7,84,ad);
 
 /* LLDP multicast address */
-static const uint8_t eth_addr_lldp[6] = {0x01, 0x80, 0xC2, 0x00, 0x00, 0x0e};
+static const struct eth_addr eth_addr_lldp = ETH_ADDR_C(01,80,c2,00,00,0e);
 
 /* Count of tests run */
 static int num_tests = 0;
@@ -84,18 +84,8 @@ check_received_aa(struct lldpd_port *sport,
 
     assert(rport->p_element.type == sport->p_element.type);
     assert(rport->p_element.mgmt_vlan == sport->p_element.mgmt_vlan);
-    assert(rport->p_element.system_id.system_mac[0] ==
-           sport->p_element.system_id.system_mac[0]);
-    assert(rport->p_element.system_id.system_mac[1] ==
-           sport->p_element.system_id.system_mac[1]);
-    assert(rport->p_element.system_id.system_mac[2] ==
-           sport->p_element.system_id.system_mac[2]);
-    assert(rport->p_element.system_id.system_mac[3] ==
-           sport->p_element.system_id.system_mac[3]);
-    assert(rport->p_element.system_id.system_mac[4] ==
-           sport->p_element.system_id.system_mac[4]);
-    assert(rport->p_element.system_id.system_mac[5] ==
-           sport->p_element.system_id.system_mac[5]);
+    assert(eth_addr_equals(rport->p_element.system_id.system_mac,
+                           sport->p_element.system_id.system_mac));
     assert(rport->p_element.system_id.conn_type ==
            sport->p_element.system_id.conn_type);
     assert(rport->p_element.system_id.rsvd ==
@@ -106,7 +96,7 @@ check_received_aa(struct lldpd_port *sport,
            sport->p_element.system_id.rsvd2[1]);
 
     /* Should receive 2 mappings */
-    assert(!list_is_empty(&rport->p_isid_vlan_maps));
+    assert(!ovs_list_is_empty(&rport->p_isid_vlan_maps));
 
     /* For each received isid/vlan mapping */
     LIST_FOR_EACH (received_map, m_entries, &rport->p_isid_vlan_maps) {
@@ -163,12 +153,8 @@ test_aa_send(void)
     hardware.h_lport.p_element.type =
         LLDP_TLV_AA_ELEM_TYPE_CLIENT_VIRTUAL_SWITCH;
     hardware.h_lport.p_element.mgmt_vlan = 0xCDC;
-    hardware.h_lport.p_element.system_id.system_mac[0] = 0x1;
-    hardware.h_lport.p_element.system_id.system_mac[1] = 0x2;
-    hardware.h_lport.p_element.system_id.system_mac[2] = 0x3;
-    hardware.h_lport.p_element.system_id.system_mac[3] = 0x4;
-    hardware.h_lport.p_element.system_id.system_mac[4] = 0x5;
-    hardware.h_lport.p_element.system_id.system_mac[5] = 0x6;
+    eth_addr_from_uint64(0x010203040506ULL,
+                         &hardware.h_lport.p_element.system_id.system_mac);
 
     hardware.h_lport.p_element.system_id.conn_type = 0x5;
     hardware.h_lport.p_element.system_id.rsvd = 0x3CC;
@@ -177,7 +163,7 @@ test_aa_send(void)
 
     /* Local chassis info */
     chassis.c_id_subtype = LLDP_CHASSISID_SUBTYPE_LLADDR;
-    chassis.c_id = chassis_mac;
+    chassis.c_id = CONST_CAST(uint8_t *, chassis_mac.ea);
     chassis.c_id_len = ETH_ADDR_LEN;
     chassis.c_name = "Dummy chassis";
     chassis.c_descr = "Long dummy chassis description";
@@ -201,7 +187,7 @@ test_aa_send(void)
     lldp = lldp_create_dummy();
     if ((lldp == NULL) ||
         (lldp->lldpd == NULL) ||
-        list_is_empty(&lldp->lldpd->g_hardware)) {
+        ovs_list_is_empty(&lldp->lldpd->g_hardware)) {
         printf("Error: unable to create dummy lldp instance");
         return 1;
     }
@@ -228,18 +214,8 @@ test_aa_send(void)
 
     hw->h_lport.p_element.type = hardware.h_lport.p_element.type;
     hw->h_lport.p_element.mgmt_vlan = hardware.h_lport.p_element.mgmt_vlan;
-    hw->h_lport.p_element.system_id.system_mac[0] =
-        hardware.h_lport.p_element.system_id.system_mac[0];
-    hw->h_lport.p_element.system_id.system_mac[1] =
-        hardware.h_lport.p_element.system_id.system_mac[1];
-    hw->h_lport.p_element.system_id.system_mac[2] =
-        hardware.h_lport.p_element.system_id.system_mac[2];
-    hw->h_lport.p_element.system_id.system_mac[3] =
-        hardware.h_lport.p_element.system_id.system_mac[3];
-    hw->h_lport.p_element.system_id.system_mac[4] =
-        hardware.h_lport.p_element.system_id.system_mac[4];
-    hw->h_lport.p_element.system_id.system_mac[5] =
-        hardware.h_lport.p_element.system_id.system_mac[5];
+    hw->h_lport.p_element.system_id.system_mac =
+        hardware.h_lport.p_element.system_id.system_mac;
 
     hw->h_lport.p_element.system_id.conn_type =
         hardware.h_lport.p_element.system_id.conn_type;
@@ -259,9 +235,9 @@ test_aa_send(void)
     map[1].isid_vlan_data.vlan    = map_init[1].isid_vlan_data.vlan;
     map[1].isid_vlan_data.isid    = map_init[1].isid_vlan_data.isid;
 
-    list_init(&hw->h_lport.p_isid_vlan_maps);
-    list_push_back(&hw->h_lport.p_isid_vlan_maps, &map[0].m_entries);
-    list_push_back(&hw->h_lport.p_isid_vlan_maps, &map[1].m_entries);
+    ovs_list_init(&hw->h_lport.p_isid_vlan_maps);
+    ovs_list_push_back(&hw->h_lport.p_isid_vlan_maps, &map[0].m_entries);
+    ovs_list_push_back(&hw->h_lport.p_isid_vlan_maps, &map[1].m_entries);
 
     /* Construct LLDPPDU (including Ethernet header) */
     eth_compose(&packet, eth_addr_lldp, eth_src, ETH_TYPE_LLDP, 0);
@@ -290,6 +266,11 @@ test_aa_send(void)
 
     /* Verify auto attach values */
     check_received_aa(&hardware.h_lport, nport, map_init);
+
+    lldpd_chassis_cleanup(nchassis, true);
+    lldpd_port_cleanup(nport, true);
+    free(nport);
+    lldp_destroy_dummy(lldp);
 
     return 0;
 }

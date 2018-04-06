@@ -18,8 +18,8 @@
 
 #include "table.h"
 
-#include "dynamic-string.h"
-#include "json.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/json.h"
 #include "ovsdb-data.h"
 #include "ovsdb-error.h"
 #include "timeval.h"
@@ -214,6 +214,9 @@ table_add_cell(struct table *table)
 static void
 table_print_table_line__(struct ds *line)
 {
+    while (ds_last(line) == ' ') {
+        line->length--;
+    }
     puts(ds_cstr(line));
     ds_clear(line);
 }
@@ -252,19 +255,31 @@ table_print_table__(const struct table *table, const struct table_style *style)
         puts(table->caption);
     }
 
-    widths = xmalloc(table->n_columns * sizeof *widths);
+    widths = xzalloc(table->n_columns * sizeof *widths);
     for (x = 0; x < table->n_columns; x++) {
         const struct column *column = &table->columns[x];
 
-        widths[x] = strlen(column->heading);
+        int w = 0;
         for (y = 0; y < table->n_rows; y++) {
             const char *text = cell_to_text(table_cell__(table, y, x), style);
             size_t length = strlen(text);
 
-            if (length > widths[x]) {
-                widths[x] = length;
+            if (length > w) {
+                w = length;
             }
         }
+
+        int max = style->max_column_width;
+        if (max > 0 && w > max) {
+            w = max;
+        }
+        if (style->headings) {
+            int min = strlen(column->heading);
+            if (w < min) {
+                w = min;
+            }
+        }
+        widths[x] = w;
     }
 
     if (style->headings) {
@@ -292,7 +307,7 @@ table_print_table__(const struct table *table, const struct table_style *style)
             if (x) {
                 ds_put_char(&line, ' ');
             }
-            ds_put_format(&line, "%-*s", widths[x], text);
+            ds_put_format(&line, "%-*.*s", widths[x], widths[x], text);
         }
         table_print_table_line__(&line);
     }
@@ -490,7 +505,6 @@ table_print_json__(const struct table *table, const struct table_style *style)
 {
     struct json *json, *headings, *data;
     size_t x, y;
-    char *s;
 
     json = json_object_create();
     if (table->caption) {
@@ -526,7 +540,7 @@ table_print_json__(const struct table *table, const struct table_style *style)
     }
     json_object_put(json, "data", data);
 
-    s = json_to_string(json, style->json_flags);
+    char *s = json_to_string(json, style->json_flags);
     json_destroy(json);
     puts(s);
     free(s);
@@ -593,4 +607,20 @@ table_print(const struct table *table, const struct table_style *style)
         table_print_json__(table, style);
         break;
     }
+}
+
+void
+table_usage(void)
+{
+    printf("\nOutput formatting options:\n"
+           "  -f, --format=FORMAT         set output formatting to FORMAT\n"
+           "                              (\"table\", \"html\", \"csv\", "
+           "or \"json\")\n"
+           "  -d, --data=FORMAT           set table cell output formatting to\n"
+           "                              FORMAT (\"string\", \"bare\", "
+           "or \"json\")\n"
+           "  --no-headings               omit table heading row\n"
+           "  --pretty                    pretty-print JSON in output\n"
+           "  --bare                      equivalent to "
+           "\"--format=list --data=bare --no-headings\"\n");
 }

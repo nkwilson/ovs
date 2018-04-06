@@ -52,15 +52,10 @@ command line has options, then those options must be separated from
 the global options by \fB\-\-\fR.
 .
 .IP "\fB\-\-db=\fIserver\fR"
-Sets \fIserver\fR as the database server that \fBvtep\-ctl\fR
-contacts to query or modify configuration.  The default is
-\fBunix:@RUNDIR@/db.sock\fR.  \fIserver\fR must take one of the
-following forms:
-.RS
-.so ovsdb/remote-active.man
-.so ovsdb/remote-passive.man
-.RE
-.
+Sets \fIserver\fR as the database server that \fBvtep\-ctl\fR contacts
+to query or modify configuration.  \fIserver\fR may be an OVSDB active
+or passive connection method, as described in \fBovsdb\fR(7).  The
+default is \fBunix:@RUNDIR@/db.sock\fR.
 .IP "\fB\-\-no\-syslog\fR"
 By default, \fBvtep\-ctl\fR logs its arguments and the details of any
 changes that it makes to the system log.  This option disables this
@@ -195,6 +190,57 @@ combination on the physical switch \fIpswitch\fR.
 List the logical switch bindings for \fIport\fR on the physical switch
 \fIpswitch\fR.
 .
+.IP "\fBset\-replication\-mode \fIlswitch replication\-mode\fR"
+Set logical switch \fIlswitch\fR replication mode to
+\fIreplication\-mode\fR; the only valid values for replication mode
+are "service_node" and "source_node".
+.
+For handling L2 broadcast, multicast and unknown unicast traffic,
+packets can be sent to all members of a logical switch referenced by
+a physical switch.  There are different modes to replicate the
+packets.  The default mode of replication is to send the traffic to
+a service node, which can be a hypervisor, server or appliance, and
+let the service node handle replication to other transport nodes
+(hypervisors or other VTEP physical switches).  This mode is called
+service node replication.  An alternate mode of replication, called
+source node replication involves the source node sending to all
+other transport nodes.  Hypervisors are always responsible for doing
+their own replication for locally attached VMs in both modes.
+Service node mode is the default, if the replication mode is not
+explicitly set.  Service node replication mode is considered a basic
+requirement because it only requires sending the packet to a single
+transport node.
+.
+.IP "\fBget\-replication\-mode \fIlswitch\fR"
+Get logical switch \fIlswitch\fR replication mode.  The only valid values
+for replication mode are "service_node" and "source_node".  An empty reply
+for replication mode implies a default of "service_node".
+.
+.SS "Logical Router Commands"
+These commands examine and manipulate logical routers.
+.
+.IP "[\fB\-\-may\-exist\fR] \fBadd\-lr \fIlrouter\fR"
+Creates a new logical router named \fIlrouter\fR.
+.IP
+Without \fB\-\-may\-exist\fR, attempting to create a router that
+exists is an error.  With \fB\-\-may\-exist\fR, this command does
+nothing if \fIlrouter\fR already exists.
+.
+.IP "[\fB\-\-if\-exists\fR] \fBdel\-lr \fIlrouter\fR"
+Deletes \fIlrouter\fR.
+.IP
+Without \fB\-\-if\-exists\fR, attempting to delete a router that does
+not exist is an error.  With \fB\-\-if\-exists\fR, attempting to
+delete a router that does not exist has no effect.
+.
+.IP "\fBlist\-lr\fR"
+Lists all existing logical routers on standard output, one per line.
+.
+.IP "\fBlr\-exists \fIlrouter\fR"
+Tests whether \fIlrouter\fR exists.  If so, \fBvtep\-ctl\fR exits
+successfully with exit code 0.  If not, \fBvtep\-ctl\fR exits
+unsuccessfully with exit code 2.
+
 .SS "Local MAC Binding Commands"
 These commands examine and manipulate local MAC bindings for the logical
 switch.  The local maps are written by the VTEP to refer to MACs it has
@@ -274,9 +320,9 @@ List the remote MAC bindings for \fIlswitch\fR, one per line.
 These commands manipulate the \fBmanagers\fR column in the \fBGlobal\fR
 table and rows in the \fBManagers\fR table.  When \fBovsdb\-server\fR is
 configured to use the \fBmanagers\fR column for OVSDB connections (as
-described in \fBINSTALL.Linux\fR and in the startup scripts provided
-with Open vSwitch), this allows the administrator to use \fBvtep\-ctl\fR
-to configure database connections.
+described in the startup scripts provided with Open vSwitch), this
+allows the administrator to use \fBvtep\-ctl\fR to configure database
+connections.
 .
 .IP "\fBget\-manager\fR"
 Prints the configured manager(s).
@@ -285,13 +331,9 @@ Prints the configured manager(s).
 Deletes the configured manager(s).
 .
 .IP "\fBset\-manager\fR \fItarget\fR\&..."
-Sets the configured manager target or targets.  Each \fItarget\fR may
-use any of the following forms:
-.
-.RS
-.so ovsdb/remote-active.man
-.so ovsdb/remote-passive.man
-.RE
+Sets the configured manager target or targets.
+Each \fItarget\fR may be an OVSDB active or passive connection method,
+e.g. \fBpssl:6640\fR, as described in \fBovsdb\fR(7).
 .
 .SS "Database Commands"
 .
@@ -343,10 +385,12 @@ encapsulated and forwarded.  Records may be identified by physical
 locator name.
 .PP
 Record names must be specified in full and with correct
-capitalization.  Names of tables and columns are not case-sensitive,
-and \fB\-\-\fR and \fB_\fR are treated interchangeably.  Unique
-abbreviations are acceptable, e.g. \fBman\fR or \fBm\fR is sufficient
-to identify the \fBManager\fR table.
+capitalization, except that UUIDs may be abbreviated to their first 4
+(or more) hex digits, as long as that is unique within the table.
+Names of tables and columns are not case-sensitive, and \fB\-\fR and
+\fB_\fR are treated interchangeably.  Unique abbreviations of table
+and column names are acceptable, e.g. \fBman\fR or \fBm\fR is
+sufficient to identify the \fBManager\fR table.
 .
 .so lib/db-ctl-base.man
 .PP

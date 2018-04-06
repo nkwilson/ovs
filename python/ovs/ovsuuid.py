@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2010, 2011 Nicira, Inc.
+# Copyright (c) 2009, 2010, 2011, 2016 Nicira, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,8 +15,11 @@
 import re
 import uuid
 
-from ovs.db import error
 import ovs.db.parser
+from ovs.db import error
+
+import six
+from six.moves import range
 
 uuidRE = re.compile("^xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx$"
                     .replace('x', '[0-9a-fA-F]'))
@@ -38,16 +41,16 @@ def from_string(s):
 
 def from_json(json, symtab=None):
     try:
-        s = ovs.db.parser.unwrap_json(json, "uuid", [str, unicode], "string")
+        s = ovs.db.parser.unwrap_json(json, "uuid", six.string_types, "string")
         if not uuidRE.match(s):
             raise error.Error("\"%s\" is not a valid UUID" % s, json)
         return uuid.UUID(s)
-    except error.Error, e:
+    except error.Error as e:
         if not symtab:
             raise e
         try:
             name = ovs.db.parser.unwrap_json(json, "named-uuid",
-                                             [str, unicode], "string")
+                                             six.string_types, "string")
         except error.Error:
             raise e
 
@@ -60,11 +63,8 @@ def to_json(uuid_):
     return ["uuid", str(uuid_)]
 
 
-def to_c_assignment(uuid_, var):
-    """Returns an array of strings, each of which contain a C statement.  The
-    statements assign 'uuid_' to a "struct uuid" as defined in Open vSwitch
-    lib/uuid.h."""
-
+def to_c_initializer(uuid_, var):
     hex_string = uuid_.hex
-    return ["%s.parts[%d] = 0x%s;" % (var, x, hex_string[x * 8:(x + 1) * 8])
+    parts = ["0x%s" % (hex_string[x * 8:(x + 1) * 8])
             for x in range(4)]
+    return "{ %s }," % ", ".join(parts)

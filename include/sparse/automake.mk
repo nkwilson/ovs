@@ -10,6 +10,8 @@ noinst_HEADERS += \
         include/sparse/pthread.h \
         include/sparse/rte_atomic.h \
         include/sparse/rte_lcore.h \
+        include/sparse/rte_memcpy.h \
         include/sparse/rte_vect.h \
         include/sparse/sys/socket.h \
+        include/sparse/sys/types.h \
         include/sparse/sys/wait.h

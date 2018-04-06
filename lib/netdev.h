@@ -17,9 +17,7 @@
 #ifndef NETDEV_H
 #define NETDEV_H 1
 
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#include "openvswitch/netdev.h"
 #include "openvswitch/types.h"
 #include "packets.h"
 #include "flow.h"
@@ -32,7 +30,7 @@ extern "C" {
  *
  * Every port on a switch must have a corresponding netdev that must minimally
  * support a few operations, such as the ability to read the netdev's MTU.
- * The PORTING file at the top of the source tree has more information in the
+ * The Porting section of the documentation has more information in the
  * "Writing a netdev Provider" section.
  *
  * Thread-safety
@@ -51,7 +49,7 @@ extern "C" {
  *      create multiple netdev_rxq objects for a single netdev and access each
  *      of those from a different thread.)
  *
- *    NETDEV_FOR_EACH_QUEUE
+ *    NETDEV_QUEUE_FOR_EACH
  *    netdev_queue_dump_next()
  *    netdev_queue_dump_done()
  *
@@ -61,8 +59,8 @@ extern "C" {
  *      netdev and access each of those from a different thread.)
  */
 
+struct dp_packet_batch;
 struct dp_packet;
-struct netdev;
 struct netdev_class;
 struct netdev_rxq;
 struct netdev_saved_flags;
@@ -73,42 +71,37 @@ struct smap;
 struct sset;
 struct ovs_action_push_tnl;
 
-/* Network device statistics.
- *
- * Values of unsupported statistics are set to all-1-bits (UINT64_MAX). */
-struct netdev_stats {
-    uint64_t rx_packets;        /* Total packets received. */
-    uint64_t tx_packets;        /* Total packets transmitted. */
-    uint64_t rx_bytes;          /* Total bytes received. */
-    uint64_t tx_bytes;          /* Total bytes transmitted. */
-    uint64_t rx_errors;         /* Bad packets received. */
-    uint64_t tx_errors;         /* Packet transmit problems. */
-    uint64_t rx_dropped;        /* No buffer space. */
-    uint64_t tx_dropped;        /* No buffer space. */
-    uint64_t multicast;         /* Multicast packets received. */
-    uint64_t collisions;
+enum netdev_pt_mode {
+    /* The netdev is packet type aware.  It can potentially carry any kind of
+     * packet.  This "modern" mode is appropriate for both netdevs that handle
+     * only a single kind of packet (such as a virtual or physical Ethernet
+     * interface) and for those that can handle multiple (such as VXLAN-GPE or
+     * Geneve). */
+    NETDEV_PT_AWARE,
 
-    /* Detailed receive errors. */
-    uint64_t rx_length_errors;
-    uint64_t rx_over_errors;    /* Receiver ring buff overflow. */
-    uint64_t rx_crc_errors;     /* Recved pkt with crc error. */
-    uint64_t rx_frame_errors;   /* Recv'd frame alignment error. */
-    uint64_t rx_fifo_errors;    /* Recv'r fifo overrun . */
-    uint64_t rx_missed_errors;  /* Receiver missed packet. */
+    /* The netdev sends and receives only Ethernet frames.  The netdev cannot
+     * carry packets other than Ethernet frames.  This is a legacy mode for
+     * backward compability with controllers that are not prepared to handle
+     * OpenFlow 1.5+ "packet_type". */
+    NETDEV_PT_LEGACY_L2,
 
-    /* Detailed transmit errors. */
-    uint64_t tx_aborted_errors;
-    uint64_t tx_carrier_errors;
-    uint64_t tx_fifo_errors;
-    uint64_t tx_heartbeat_errors;
-    uint64_t tx_window_errors;
+    /* The netdev sends and receives only IPv4 and IPv6 packets.  The netdev
+     * cannot carry Ethernet frames or other kinds of packets.
+     *
+     * IPv4 and IPv6 packets carried over the netdev are treated as Ethernet:
+     * when they are received, they are converted to Ethernet by adding a dummy
+     * header with the proper Ethertype; on tranmission, the Ethernet header is
+     * stripped.  This is a legacy mode for backward compability with
+     * controllers that are not prepared to handle OpenFlow 1.5+
+     * "packet_type". */
+    NETDEV_PT_LEGACY_L3,
 };
 
 /* Configuration specific to tunnels. */
 struct netdev_tunnel_config {
+    ovs_be64 in_key;
     bool in_key_present;
     bool in_key_flow;
-    ovs_be64 in_key;
 
     bool out_key_present;
     bool out_key_flow;
@@ -118,10 +111,12 @@ struct netdev_tunnel_config {
 
     bool ip_src_flow;
     bool ip_dst_flow;
-    ovs_be32 ip_src;
-    ovs_be32 ip_dst;
+    struct in6_addr ipv6_src;
+    struct in6_addr ipv6_dst;
 
     uint32_t exts;
+    uint32_t egress_pkt_mark;
+    bool set_egress_pkt_mark;
 
     uint8_t ttl;
     bool ttl_inherit;
@@ -130,8 +125,8 @@ struct netdev_tunnel_config {
     bool tos_inherit;
 
     bool csum;
-    bool ipsec;
     bool dont_fragment;
+    enum netdev_pt_mode pt_mode;
 };
 
 void netdev_run(void);
@@ -143,6 +138,7 @@ bool netdev_is_reserved_name(const char *name);
 int netdev_n_txq(const struct netdev *netdev);
 int netdev_n_rxq(const struct netdev *netdev);
 bool netdev_is_pmd(const struct netdev *netdev);
+bool netdev_has_tunnel_push_pop(const struct netdev *netdev);
 
 /* Open and close. */
 int netdev_open(const char *name, const char *type, struct netdev **netdevp);
@@ -165,72 +161,106 @@ const char *netdev_get_name(const struct netdev *);
 const char *netdev_get_type(const struct netdev *);
 const char *netdev_get_type_from_name(const char *);
 int netdev_get_mtu(const struct netdev *, int *mtup);
-int netdev_set_mtu(const struct netdev *, int mtu);
+int netdev_set_mtu(struct netdev *, int mtu);
+void netdev_mtu_user_config(struct netdev *, bool);
+bool netdev_mtu_is_user_config(struct netdev *);
 int netdev_get_ifindex(const struct netdev *);
-int netdev_set_multiq(struct netdev *, unsigned int n_txq, unsigned int n_rxq);
+int netdev_set_tx_multiq(struct netdev *, unsigned int n_txq);
+enum netdev_pt_mode netdev_get_pt_mode(const struct netdev *);
 
 /* Packet reception. */
 int netdev_rxq_open(struct netdev *, struct netdev_rxq **, int id);
 void netdev_rxq_close(struct netdev_rxq *);
 
 const char *netdev_rxq_get_name(const struct netdev_rxq *);
+int netdev_rxq_get_queue_id(const struct netdev_rxq *);
 
-int netdev_rxq_recv(struct netdev_rxq *rx, struct dp_packet **buffers,
-                    int *cnt);
+int netdev_rxq_recv(struct netdev_rxq *rx, struct dp_packet_batch *);
 void netdev_rxq_wait(struct netdev_rxq *);
 int netdev_rxq_drain(struct netdev_rxq *);
 
 /* Packet transmission. */
-int netdev_send(struct netdev *, int qid, struct dp_packet **, int cnt,
-                bool may_steal);
+int netdev_send(struct netdev *, int qid, struct dp_packet_batch *,
+                bool concurrent_txq);
 void netdev_send_wait(struct netdev *, int qid);
 
+/* Flow offloading. */
+struct offload_info {
+    const struct dpif_class *dpif_class;
+    ovs_be16 tp_dst_port; /* Destination port for tunnel in SET action */
+};
+struct dpif_class;
+struct netdev_flow_dump;
+int netdev_flow_flush(struct netdev *);
+int netdev_flow_dump_create(struct netdev *, struct netdev_flow_dump **dump);
+int netdev_flow_dump_destroy(struct netdev_flow_dump *);
+bool netdev_flow_dump_next(struct netdev_flow_dump *, struct match *,
+                          struct nlattr **actions, struct dpif_flow_stats *,
+                          ovs_u128 *ufid, struct ofpbuf *rbuffer,
+                          struct ofpbuf *wbuffer);
+int netdev_flow_put(struct netdev *, struct match *, struct nlattr *actions,
+                    size_t actions_len, const ovs_u128 *,
+                    struct offload_info *, struct dpif_flow_stats *);
+int netdev_flow_get(struct netdev *, struct match *, struct nlattr **actions,
+                    const ovs_u128 *, struct dpif_flow_stats *,
+                    struct ofpbuf *wbuffer);
+int netdev_flow_del(struct netdev *, const ovs_u128 *,
+                    struct dpif_flow_stats *);
+int netdev_init_flow_api(struct netdev *);
+bool netdev_is_flow_api_enabled(void);
+void netdev_set_flow_api_enabled(const struct smap *ovs_other_config);
+
+struct dpif_port;
+int netdev_ports_insert(struct netdev *, const struct dpif_class *,
+                        struct dpif_port *);
+struct netdev *netdev_ports_get(odp_port_t port, const struct dpif_class *);
+int netdev_ports_remove(odp_port_t port, const struct dpif_class *);
+odp_port_t netdev_ifindex_to_odp_port(int ifindex);
+struct netdev_flow_dump **netdev_ports_flow_dump_create(
+                                        const struct dpif_class *,
+                                        int *ports);
+void netdev_ports_flow_flush(const struct dpif_class *);
+int netdev_ports_flow_del(const struct dpif_class *, const ovs_u128 *ufid,
+                          struct dpif_flow_stats *stats);
+int netdev_ports_flow_get(const struct dpif_class *, struct match *match,
+                          struct nlattr **actions,
+                          const ovs_u128 *ufid,
+                          struct dpif_flow_stats *stats,
+                          struct ofpbuf *buf);
+
+/* native tunnel APIs */
+/* Structure to pass parameters required to build a tunnel header. */
+struct netdev_tnl_build_header_params {
+    const struct flow *flow;
+    const struct in6_addr *s_ip;
+    struct eth_addr dmac;
+    struct eth_addr smac;
+    bool is_ipv6;
+};
+
+void
+netdev_init_tnl_build_header_params(struct netdev_tnl_build_header_params *params,
+                                    const struct flow *tnl_flow,
+                                    const struct in6_addr *src,
+                                    struct eth_addr dmac,
+                                    struct eth_addr smac);
+
 int netdev_build_header(const struct netdev *, struct ovs_action_push_tnl *data,
-                        const struct flow *tnl_flow);
+                        const struct netdev_tnl_build_header_params *params);
+
 int netdev_push_header(const struct netdev *netdev,
-                       struct dp_packet **buffers, int cnt,
+                       struct dp_packet_batch *,
                        const struct ovs_action_push_tnl *data);
-int netdev_pop_header(struct netdev *netdev, struct dp_packet **buffers,
-                      int cnt);
+void netdev_pop_header(struct netdev *netdev, struct dp_packet_batch *);
 
 /* Hardware address. */
-int netdev_set_etheraddr(struct netdev *, const uint8_t mac[ETH_ADDR_LEN]);
-int netdev_get_etheraddr(const struct netdev *, uint8_t mac[ETH_ADDR_LEN]);
+int netdev_set_etheraddr(struct netdev *, const struct eth_addr mac);
+int netdev_get_etheraddr(const struct netdev *, struct eth_addr *mac);
 
 /* PHY interface. */
 bool netdev_get_carrier(const struct netdev *);
 long long int netdev_get_carrier_resets(const struct netdev *);
 int netdev_set_miimon_interval(struct netdev *, long long int interval);
-
-/* Features. */
-enum netdev_features {
-    NETDEV_F_10MB_HD =    1 << 0,  /* 10 Mb half-duplex rate support. */
-    NETDEV_F_10MB_FD =    1 << 1,  /* 10 Mb full-duplex rate support. */
-    NETDEV_F_100MB_HD =   1 << 2,  /* 100 Mb half-duplex rate support. */
-    NETDEV_F_100MB_FD =   1 << 3,  /* 100 Mb full-duplex rate support. */
-    NETDEV_F_1GB_HD =     1 << 4,  /* 1 Gb half-duplex rate support. */
-    NETDEV_F_1GB_FD =     1 << 5,  /* 1 Gb full-duplex rate support. */
-    NETDEV_F_10GB_FD =    1 << 6,  /* 10 Gb full-duplex rate support. */
-    NETDEV_F_40GB_FD =    1 << 7,  /* 40 Gb full-duplex rate support. */
-    NETDEV_F_100GB_FD =   1 << 8,  /* 100 Gb full-duplex rate support. */
-    NETDEV_F_1TB_FD =     1 << 9,  /* 1 Tb full-duplex rate support. */
-    NETDEV_F_OTHER =      1 << 10, /* Other rate, not in the list. */
-    NETDEV_F_COPPER =     1 << 11, /* Copper medium. */
-    NETDEV_F_FIBER =      1 << 12, /* Fiber medium. */
-    NETDEV_F_AUTONEG =    1 << 13, /* Auto-negotiation. */
-    NETDEV_F_PAUSE =      1 << 14, /* Pause. */
-    NETDEV_F_PAUSE_ASYM = 1 << 15, /* Asymmetric pause. */
-};
-
-int netdev_get_features(const struct netdev *,
-                        enum netdev_features *current,
-                        enum netdev_features *advertised,
-                        enum netdev_features *supported,
-                        enum netdev_features *peer);
-uint64_t netdev_features_to_bps(enum netdev_features features,
-                                uint64_t default_bps);
-bool netdev_features_is_full_duplex(enum netdev_features features);
-int netdev_set_advertisements(struct netdev *, enum netdev_features advertise);
 
 /* Flags. */
 enum netdev_flags {
@@ -250,22 +280,24 @@ int netdev_turn_flags_off(struct netdev *, enum netdev_flags,
 void netdev_restore_flags(struct netdev_saved_flags *);
 
 /* TCP/IP stack interface. */
-int netdev_get_in4(const struct netdev *, struct in_addr *address,
-                   struct in_addr *netmask);
 int netdev_set_in4(struct netdev *, struct in_addr addr, struct in_addr mask);
 int netdev_get_in4_by_name(const char *device_name, struct in_addr *in4);
-int netdev_get_in6(const struct netdev *, struct in6_addr *);
+int netdev_get_addr_list(const struct netdev *netdev, struct in6_addr **addr,
+                         struct in6_addr **mask, int *n_in6);
+
 int netdev_add_router(struct netdev *, struct in_addr router);
 int netdev_get_next_hop(const struct netdev *, const struct in_addr *host,
                         struct in_addr *next_hop, char **);
 int netdev_get_status(const struct netdev *, struct smap *);
 int netdev_arp_lookup(const struct netdev *, ovs_be32 ip,
-                      uint8_t mac[ETH_ADDR_LEN]);
+                      struct eth_addr *mac);
 
 struct netdev *netdev_find_dev_by_in4(const struct in_addr *);
 
 /* Statistics. */
 int netdev_get_stats(const struct netdev *, struct netdev_stats *);
+int netdev_get_custom_stats(const struct netdev *,
+                            struct netdev_custom_stats *);
 
 /* Quality of service. */
 struct netdev_qos_capabilities {
@@ -306,6 +338,10 @@ int netdev_get_queue_stats(const struct netdev *, unsigned int queue_id,
                            struct netdev_queue_stats *);
 uint64_t netdev_get_change_seq(const struct netdev *);
 
+int netdev_reconfigure(struct netdev *netdev);
+void netdev_wait_reconf_required(struct netdev *netdev);
+bool netdev_is_reconf_required(struct netdev *netdev);
+
 struct netdev_queue_dump {
     struct netdev *netdev;
     int error;
@@ -338,8 +374,13 @@ typedef void netdev_dump_queue_stats_cb(unsigned int queue_id,
 int netdev_dump_queue_stats(const struct netdev *,
                             netdev_dump_queue_stats_cb *, void *aux);
 
-enum { NETDEV_MAX_BURST = 32 }; /* Maximum number packets in a batch. */
 extern struct seq *tnl_conf_seq;
+
+#ifndef _WIN32
+void netdev_get_addrs_list_flush(void);
+int netdev_get_addrs(const char dev[], struct in6_addr **paddr,
+                     struct in6_addr **pmask, int *n_in6);
+#endif
 
 #ifdef  __cplusplus
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, 2012, 2013, 2014 Nicira, Inc.
+/* Copyright (c) 2011, 2012, 2013, 2014, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,25 +16,29 @@
 #ifndef BUNDLE_H
 #define BUNDLE_H 1
 
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "compiler.h"
-#include "ofp-errors.h"
 #include "openflow/nicira-ext.h"
+#include "openvswitch/ofp-errors.h"
 #include "openvswitch/types.h"
 
 struct ds;
 struct flow;
 struct flow_wildcards;
+struct match;
 struct ofpact_bundle;
 struct ofpbuf;
+struct ofputil_port_map;
 
 /* NXAST_BUNDLE helper functions.
  *
- * See include/openflow/nicira-ext.h for NXAST_BUNDLE specification. */
+ * See lib/ofp-actions.c for NXAST_BUNDLE specification. */
 
 #define BUNDLE_MAX_SLAVES 2048
 
@@ -43,10 +47,13 @@ ofp_port_t bundle_execute(const struct ofpact_bundle *, const struct flow *,
                         bool (*slave_enabled)(ofp_port_t ofp_port, void *aux),
                         void *aux);
 enum ofperr bundle_check(const struct ofpact_bundle *, ofp_port_t max_ports,
-                         const struct flow *);
-char *bundle_parse(const char *, struct ofpbuf *ofpacts) OVS_WARN_UNUSED_RESULT;
-char *bundle_parse_load(const char *, struct ofpbuf *ofpacts)
+                         const struct match *);
+char *bundle_parse(const char *, const struct ofputil_port_map *port_map,
+                   struct ofpbuf *ofpacts) OVS_WARN_UNUSED_RESULT;
+char *bundle_parse_load(const char *, const struct ofputil_port_map *port_map,
+                        struct ofpbuf *ofpacts)
     OVS_WARN_UNUSED_RESULT;
-void bundle_format(const struct ofpact_bundle *, struct ds *);
+void bundle_format(const struct ofpact_bundle *,
+                   const struct ofputil_port_map *, struct ds *);
 
 #endif /* bundle.h */

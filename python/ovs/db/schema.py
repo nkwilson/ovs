@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2010, 2011 Nicira, Inc.
+# Copyright (c) 2009, 2010, 2011, 2016 Nicira, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,9 +15,11 @@
 import re
 import sys
 
-from ovs.db import error
 import ovs.db.parser
-from ovs.db import types
+import ovs.db.types
+from ovs.db import error
+
+import six
 
 
 def _check_id(name, json):
@@ -30,7 +32,7 @@ def _check_id(name, json):
 class DbSchema(object):
     """Schema for an OVSDB database."""
 
-    def __init__(self, name, version, tables):
+    def __init__(self, name, version, tables, allow_extensions=False):
         self.name = name
         self.version = version
         self.tables = tables
@@ -40,7 +42,7 @@ class DbSchema(object):
         # backward compatibility, if the root set is empty then assume that
         # every table is in the root set.
         if self.__root_set_size() == 0:
-            for table in self.tables.itervalues():
+            for table in six.itervalues(self.tables):
                 table.is_root = True
 
         # Find the "ref_table"s referenced by "ref_table_name"s.
@@ -48,25 +50,25 @@ class DbSchema(object):
         # Also force certain columns to be persistent, as explained in
         # __check_ref_table().  This requires 'is_root' to be known, so this
         # must follow the loop updating 'is_root' above.
-        for table in self.tables.itervalues():
-            for column in table.columns.itervalues():
+        for table in six.itervalues(self.tables):
+            for column in six.itervalues(table.columns):
                 self.__follow_ref_table(column, column.type.key, "key")
                 self.__follow_ref_table(column, column.type.value, "value")
 
     def __root_set_size(self):
         """Returns the number of tables in the schema's root set."""
         n_root = 0
-        for table in self.tables.itervalues():
+        for table in six.itervalues(self.tables):
             if table.is_root:
                 n_root += 1
         return n_root
 
     @staticmethod
-    def from_json(json):
+    def from_json(json, allow_extensions=False):
         parser = ovs.db.parser.Parser(json, "database schema")
         name = parser.get("name", ['id'])
-        version = parser.get_optional("version", [str, unicode])
-        parser.get_optional("cksum", [str, unicode])
+        version = parser.get_optional("version", six.string_types)
+        parser.get_optional("cksum", six.string_types)
         tablesJson = parser.get("tables", [dict])
         parser.finish()
 
@@ -76,9 +78,10 @@ class DbSchema(object):
                               % version)
 
         tables = {}
-        for tableName, tableJson in tablesJson.iteritems():
+        for tableName, tableJson in six.iteritems(tablesJson):
             _check_id(tableName, json)
-            tables[tableName] = TableSchema.from_json(tableJson, tableName)
+            tables[tableName] = TableSchema.from_json(tableJson, tableName,
+                                                      allow_extensions)
 
         return DbSchema(name, version, tables)
 
@@ -90,7 +93,7 @@ class DbSchema(object):
         default_is_root = self.__root_set_size() == len(self.tables)
 
         tables = {}
-        for table in self.tables.itervalues():
+        for table in six.itervalues(self.tables):
             tables[table.name] = table.to_json(default_is_root)
         json = {"name": self.name, "tables": tables}
         if self.version:
@@ -101,7 +104,8 @@ class DbSchema(object):
         return DbSchema.from_json(self.to_json())
 
     def __follow_ref_table(self, column, base, base_name):
-        if not base or base.type != types.UuidType or not base.ref_table_name:
+        if (not base or base.type != ovs.db.types.UuidType
+                or not base.ref_table_name):
             return
 
         base.ref_table = self.tables.get(base.ref_table_name)
@@ -122,34 +126,41 @@ class DbSchema(object):
 
 
 class IdlSchema(DbSchema):
-    def __init__(self, name, version, tables, idlPrefix, idlHeader):
+    def __init__(self, name, version, tables, idlPrefix, idlHeader,
+                 cDecls, hDecls):
         DbSchema.__init__(self, name, version, tables)
         self.idlPrefix = idlPrefix
         self.idlHeader = idlHeader
+        self.cDecls = cDecls
+        self.hDecls = hDecls
 
     @staticmethod
     def from_json(json):
         parser = ovs.db.parser.Parser(json, "IDL schema")
-        idlPrefix = parser.get("idlPrefix", [str, unicode])
-        idlHeader = parser.get("idlHeader", [str, unicode])
+        idlPrefix = parser.get("idlPrefix", six.string_types)
+        idlHeader = parser.get("idlHeader", six.string_types)
+        cDecls = parser.get_optional("cDecls", six.string_types, "")
+        hDecls = parser.get_optional("hDecls", six.string_types, "")
 
         subjson = dict(json)
         del subjson["idlPrefix"]
         del subjson["idlHeader"]
-        schema = DbSchema.from_json(subjson)
+        subjson.pop("cDecls", None)
+        subjson.pop("hDecls", None)
+        schema = DbSchema.from_json(subjson, allow_extensions=True)
 
         return IdlSchema(schema.name, schema.version, schema.tables,
-                         idlPrefix, idlHeader)
+                         idlPrefix, idlHeader, cDecls, hDecls)
 
 
 def column_set_from_json(json, columns):
     if json is None:
         return tuple(columns)
-    elif type(json) != list:
+    elif not isinstance(json, list):
         raise error.Error("array of distinct column names expected", json)
     else:
         for column_name in json:
-            if type(column_name) not in [str, unicode]:
+            if not isinstance(column_name, six.string_types):
                 raise error.Error("array of distinct column names expected",
                                   json)
             elif column_name not in columns:
@@ -162,27 +173,32 @@ def column_set_from_json(json, columns):
 
 
 class TableSchema(object):
-    def __init__(self, name, columns, mutable=True, max_rows=sys.maxint,
-                 is_root=True, indexes=[]):
+    def __init__(self, name, columns, mutable=True, max_rows=sys.maxsize,
+                 is_root=True, indexes=[], extensions={}):
         self.name = name
         self.columns = columns
         self.mutable = mutable
         self.max_rows = max_rows
         self.is_root = is_root
         self.indexes = indexes
+        self.extensions = extensions
 
     @staticmethod
-    def from_json(json, name):
+    def from_json(json, name, allow_extensions=False):
         parser = ovs.db.parser.Parser(json, "table schema for table %s" % name)
         columns_json = parser.get("columns", [dict])
         mutable = parser.get_optional("mutable", [bool], True)
         max_rows = parser.get_optional("maxRows", [int])
         is_root = parser.get_optional("isRoot", [bool], False)
         indexes_json = parser.get_optional("indexes", [list], [])
+        if allow_extensions:
+            extensions = parser.get_optional("extensions", [dict], {})
+        else:
+            extensions = {}
         parser.finish()
 
-        if max_rows == None:
-            max_rows = sys.maxint
+        if max_rows is None:
+            max_rows = sys.maxsize
         elif max_rows <= 0:
             raise error.Error("maxRows must be at least 1", json)
 
@@ -190,10 +206,11 @@ class TableSchema(object):
             raise error.Error("table must have at least one column", json)
 
         columns = {}
-        for column_name, column_json in columns_json.iteritems():
+        for column_name, column_json in six.iteritems(columns_json):
             _check_id(column_name, json)
             columns[column_name] = ColumnSchema.from_json(column_json,
-                                                          column_name)
+                                                          column_name,
+                                                          allow_extensions)
 
         indexes = []
         for index_json in indexes_json:
@@ -208,7 +225,8 @@ class TableSchema(object):
                                       "not be indexed" % column.name, json)
             indexes.append(index)
 
-        return TableSchema(name, columns, mutable, max_rows, is_root, indexes)
+        return TableSchema(name, columns, mutable, max_rows, is_root, indexes,
+                           extensions)
 
     def to_json(self, default_is_root=False):
         """Returns this table schema serialized into JSON.
@@ -229,11 +247,11 @@ class TableSchema(object):
             json["isRoot"] = self.is_root
 
         json["columns"] = columns = {}
-        for column in self.columns.itervalues():
+        for column in six.itervalues(self.columns):
             if not column.name.startswith("_"):
                 columns[column.name] = column.to_json()
 
-        if self.max_rows != sys.maxint:
+        if self.max_rows != sys.maxsize:
             json["maxRows"] = self.max_rows
 
         if self.indexes:
@@ -245,22 +263,35 @@ class TableSchema(object):
 
 
 class ColumnSchema(object):
-    def __init__(self, name, mutable, persistent, type_):
+    def __init__(self, name, mutable, persistent, type_, extensions={}):
         self.name = name
         self.mutable = mutable
         self.persistent = persistent
         self.type = type_
         self.unique = False
+        self.extensions = extensions
 
     @staticmethod
-    def from_json(json, name):
+    def from_json(json, name, allow_extensions=False):
         parser = ovs.db.parser.Parser(json, "schema for column %s" % name)
         mutable = parser.get_optional("mutable", [bool], True)
         ephemeral = parser.get_optional("ephemeral", [bool], False)
-        type_ = types.Type.from_json(parser.get("type", [dict, str, unicode]))
+        _types = list(six.string_types)
+        _types.extend([dict])
+        type_ = ovs.db.types.Type.from_json(parser.get("type", _types))
+        if allow_extensions:
+            extensions = parser.get_optional("extensions", [dict], {})
+        else:
+            extensions = {}
         parser.finish()
 
-        return ColumnSchema(name, mutable, not ephemeral, type_)
+        if not mutable and (type_.key.is_weak_ref()
+                            or (type_.value and type_.value.is_weak_ref())):
+            # We cannot allow a weak reference to be immutable: if referenced
+            # rows are deleted, then the weak reference needs to change.
+            mutable = True
+
+        return ColumnSchema(name, mutable, not ephemeral, type_, extensions)
 
     def to_json(self):
         json = {"type": self.type.to_json()}
@@ -268,4 +299,6 @@ class ColumnSchema(object):
             json["mutable"] = False
         if not self.persistent:
             json["ephemeral"] = True
+        if self.extensions:
+            json["extensions"] = self.extensions
         return json
